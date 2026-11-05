@@ -29,6 +29,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 from mcp_baf.dumpindex.modulenames import OBJECT_TYPE_TO_DUMP_DIR, nfc
+from mcp_baf.dumpindex.xmlguard import parse_bytes, parse_file
 
 
 @dataclass
@@ -142,18 +143,28 @@ def find_form_files(
         if os.path.isfile(form_xml) and os.path.realpath(form_xml).startswith(root):
             # Ключ — NFC-имя формы (macOS отдаёт listdir в NFD, а form_name
             # из запроса приходит в NFC); путь хранит сырое имя с диска.
-            result[nfc(entry)] = form_xml
+            key = nfc(entry)
+            if key in result and result[key] != form_xml:
+                # Два разных файла с диска сошлись в одно NFC-имя: отдать
+                # один «первому попавшемуся» значит молча показать чужую
+                # форму — отвергаем оба как неоднозначные.
+                raise ValueError(
+                    f"ambiguous form names for {object_name!r}: "
+                    f"{result[key]!r} and {form_xml!r} normalize to {key!r}"
+                )
+            result[key] = form_xml
     return result
 
 
 def parse_form_xml(path: str) -> FormInfo:
     """Разбирает Form.xml и извлекает элементы, команды и обработчики."""
-    tree = ET.parse(path)
-    return _parse_form_root(tree.getroot())
+    return _parse_form_root(parse_file(path))
 
 
 def parse_form_xml_data(data: bytes | str) -> FormInfo:
-    return _parse_form_root(ET.fromstring(data))
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return _parse_form_root(parse_bytes(data))
 
 
 def _local(elem: ET.Element) -> str:

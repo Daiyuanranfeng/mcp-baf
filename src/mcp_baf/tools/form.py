@@ -59,6 +59,7 @@ def register(
             # HTTP-endpoint отдаёт имя и заголовок формы (синоним из конфигурации).
             form: dict[str, Any] = {}
             http_error: Exception | None = None
+            dump_note = ""
             try:
                 form = await client.get(f"/form/{object_type}/{object_name}")
             except OneCError as exc:
@@ -84,6 +85,10 @@ def register(
                         "Form dump enrichment failed: object=%s.%s form=%s error=%s",
                         object_type, object_name, form_name, dump_error,
                     )
+                    # Без пометки пустой состав элементов выглядит как «у формы их нет».
+                    dump_note = (
+                        f"\n\n> Структура из dump недоступна: {dump_error}"
+                    )
                 else:
                     merge_dump_into_form(form, dump_form)
             elif http_error is not None:
@@ -91,7 +96,7 @@ def register(
                     f"fetching form structure from 1C: {http_error}"
                 ) from http_error
 
-            return format_form_structure(form)
+            return format_form_structure(form) + dump_note
 
         return await traced_text(
             audit, "get_form_structure", run,

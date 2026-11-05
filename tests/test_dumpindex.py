@@ -171,3 +171,82 @@ def test_symlink_bsl_outside_dump_skipped(tmp_path):
         assert total == 0
     finally:
         idx.close()
+
+
+# ── Вложенные корни расширений (<обёртка>/<ext>/Configuration.xml) ──
+
+MANIFEST = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">\n'
+    "  <Configuration><Properties><Name>{name}</Name>"
+    "<ConfigurationExtensionPurpose>AddOn</ConfigurationExtensionPurpose></Properties>"
+    "</Configuration>\n</MetaDataObject>\n"
+)
+
+
+def mk_manifest(root, rel_dir, name):
+    path = root / rel_dir / "Configuration.xml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(MANIFEST.format(name=name), encoding="utf-8")
+
+
+def test_nested_extension_root_gets_ext_namespace(tmp_path):
+    # Сценарий feenlace/mcp-1c issue 46: обёртка Mach3/extension глубже
+    # первого уровня. Без распознавания манифеста модуль расширения получал
+    # ключ «Mach3.extension.МодульОбъекта»; основной конфигурации теперь
+    # ничего не теряют и расширение получает своё пространство имён.
+    mk_bsl(tmp_path, "Documents/ПеремещениеЗапасов/Ext/ObjectModule.bsl",
+           "ДвиженияСформированы = Истина;")
+    mk_manifest(tmp_path, "Mach3/extension", "ИнтеграцияMach3")
+    mk_bsl(tmp_path, "Mach3/extension/Documents/ПеремещениеЗапасов/Ext/ObjectModule.bsl",
+           "ДвиженияСформированы = Ложь;")
+    idx = DumpIndex(str(tmp_path), use_cache=False)
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    try:
+        matches, total = idx.search(
+            SearchParams(query="ДвиженияСформированы", mode="exact", limit=10))
+        names = {m.module for m in matches}
+        assert total == 2
+        assert "Документ.ПеремещениеЗапасов.МодульОбъекта" in names
+        assert "ext.ИнтеграцияMach3.Документ.ПеремещениеЗапасов.МодульОбъекта" in names
+    finally:
+        idx.close()
+
+
+def test_warm_cache_added_file_under_nested_ext_root(tmp_path):
+    dump, cache = tmp_path / "dump", tmp_path / "cache"
+    dump.mkdir()
+    mk_bsl(dump, "Catalogs/Тест/Ext/ObjectModule.bsl", "А = 1;")
+    idx = DumpIndex(str(dump), cache_dir=str(cache))
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    idx.close()
+
+    mk_manifest(dump, "Обёртка/расш", "МоеРасширение")
+    mk_bsl(dump, "Обёртка/расш/CommonModules/МодульРасш/Module.bsl", "Б = 2;")
+    idx = DumpIndex(str(dump), cache_dir=str(cache))
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    try:
+        matches, total = idx.search(SearchParams(query="Б = 2;", mode="exact"))
+        assert total == 1
+        assert matches[0].module == "ext.МоеРасширение.ОбщийМодуль.МодульРасш.Модуль"
+    finally:
+        idx.close()
+
+
+def test_warm_cache_rebuilds_when_ext_roots_change(tmp_path):
+    # Манифест добавлен к уже проиндексированным файлам: их ключи в кэше
+    # устарели, кэш должен перестроиться, а не отдавать path-ключи.
+    dump, cache = tmp_path / "dump", tmp_path / "cache"
+    mk_bsl(dump, "Обёртка/расш/CommonModules/М/Module.bsl", "Б = 2;")
+    idx = DumpIndex(str(dump), cache_dir=str(cache))
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    idx.close()
+
+    mk_manifest(dump, "Обёртка/расш", "Расш")
+    idx = DumpIndex(str(dump), cache_dir=str(cache))
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    try:
+        matches, _ = idx.search(SearchParams(query="Б = 2;", mode="exact"))
+        assert matches[0].module == "ext.Расш.ОбщийМодуль.М.Модуль"
+    finally:
+        idx.close()

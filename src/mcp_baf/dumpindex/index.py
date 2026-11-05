@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -27,10 +28,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from mcp_baf.dumpindex.cache import index_db_path
+from mcp_baf.dumpindex.extroots import discover_extension_roots
 from mcp_baf.dumpindex.modulenames import (
-    bsl_path_to_module_name,
     nfc,
     parse_module_name,
+    resolve_module_name,
 )
 from mcp_baf.dumpindex.synonyms import build_synonym_map
 
@@ -40,7 +42,10 @@ logger = logging.getLogger(__name__)
 # v2: имена модулей NFC-нормализованы — кэш, построенный до фикса на macOS,
 # хранит NFD-ключи, которые NFC-запрос никогда не найдёт, поэтому он
 # перестраивается (аналог bump dumpIndexSchemaVersion в Go-версии).
-SCHEMA_VERSION = 2
+# v3: вложенные корни расширений (<обёртка>/<extension>/Configuration.xml)
+# получают ext.<имя>-пространство (порт фикса feenlace/mcp-1c issue 46).
+# Без подъёма версии тёплый кэш продолжал бы отдавать старые path-ключи.
+SCHEMA_VERSION = 3
 
 # Окно контекста вокруг найденной строки, в строках с каждой стороны.
 CONTEXT_WINDOW = 2
@@ -103,6 +108,9 @@ class DumpIndex:
         self._ready = threading.Event()
         self._build_error: Exception | None = None
         self._module_count = 0
+        # rel_dir -> имя расширения из вложенного Configuration.xml;
+        # заполняется в _build перед выводом ключей (см. dumpindex.extroots).
+        self._ext_roots: dict[str, str] = {}
         self._thread = threading.Thread(
             target=self._build, name="dump-index-build", daemon=True
         )
@@ -116,6 +124,10 @@ class DumpIndex:
 
     def _build(self) -> None:
         try:
+            # Карта вложенных корней расширений нужна до вывода любых
+            # ключей (и на холодную сборку, и на diff кэша).
+            self._ext_roots = discover_extension_roots(self._dir)
+
             if self._db_path and self._reindex and os.path.exists(self._db_path):
                 os.remove(self._db_path)
 
@@ -179,6 +191,9 @@ class DumpIndex:
         db.execute(
             "INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
         )
+        db.execute(
+            "INSERT INTO meta VALUES ('ext_roots', ?)", (self._ext_roots_key(),)
+        )
 
     def _walk_files(self) -> dict[str, _FileState]:
         """Собирает состояние всех .bsl файлов: rel_path -> (путь, mtime, size)."""
@@ -225,11 +240,12 @@ class DumpIndex:
             contents = dict(filter(None, pool.map(read_one, files.items())))
 
         rows = []
-        for rel in sorted(files, key=lambda r: bsl_path_to_module_name(r)):
+        sort_key = lambda rel: resolve_module_name(rel, self._ext_roots)  # noqa: E731
+        for rel in sorted(files, key=sort_key):
             if rel not in contents:
                 continue
             state = files[rel]
-            name = bsl_path_to_module_name(rel)
+            name = resolve_module_name(rel, self._ext_roots)
             parts = parse_module_name(name)
             rows.append((
                 rel, name, parts.category, parts.module,
@@ -249,6 +265,9 @@ class DumpIndex:
             )
         self._db = db
 
+    def _ext_roots_key(self) -> str:
+        return json.dumps(self._ext_roots, sort_keys=True, ensure_ascii=False)
+
     def _open_cache_and_diff(self) -> None:
         """Открывает кэш и инкрементально применяет изменения файлов."""
         # Соединение сразу сохраняется в self._db: при любой ошибке ниже
@@ -260,6 +279,13 @@ class DumpIndex:
         ).fetchone()
         if version is None or int(version[0]) != SCHEMA_VERSION:
             raise RuntimeError(f"cache schema version mismatch: {version}")
+        # Имена модулей зависят от карты вложенных расширений: если манифест
+        # добавили/убрали/переименовали, ключи в кэше устарели целиком.
+        roots = db.execute(
+            "SELECT value FROM meta WHERE key = 'ext_roots'"
+        ).fetchone()
+        if roots is None or roots[0] != self._ext_roots_key():
+            raise RuntimeError("extension roots changed since cache was built")
 
         on_disk = self._walk_files()
         manifest = {
@@ -307,7 +333,7 @@ class DumpIndex:
                 content = self._read_content(on_disk[rel].abs_path)
                 if content is None:
                     continue
-                name = bsl_path_to_module_name(rel)
+                name = resolve_module_name(rel, self._ext_roots)
                 parts = parse_module_name(name)
                 cur = db.execute(
                     "INSERT INTO docs(rel_path, name, category, module, "
