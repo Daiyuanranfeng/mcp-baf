@@ -178,7 +178,8 @@ def test_symlink_bsl_outside_dump_skipped(tmp_path):
 MANIFEST = (
     '<?xml version="1.0" encoding="UTF-8"?>\n'
     '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">\n'
-    "  <Configuration><Properties><Name>{name}</Name></Properties>"
+    "  <Configuration><Properties><Name>{name}</Name>"
+    "<ConfigurationExtensionPurpose>AddOn</ConfigurationExtensionPurpose></Properties>"
     "</Configuration>\n</MetaDataObject>\n"
 )
 

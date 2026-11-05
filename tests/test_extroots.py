@@ -14,6 +14,7 @@ MANIFEST_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
     <Properties>
       <Name>{name}</Name>
       <Version>1.0.0</Version>
+      <ConfigurationExtensionPurpose>AddOn</ConfigurationExtensionPurpose>
     </Properties>
   </Configuration>
 </MetaDataObject>
@@ -24,7 +25,17 @@ MANIFEST_FLAT = """<?xml version="1.0" encoding="UTF-8"?>
 <MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
   <Configuration uuid="3c3d7fc2-4bc0-4a3e-b90a-0d528f3f512f">
     <Name>{name}</Name>
+    <ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>
   </Configuration>
+</MetaDataObject>
+"""
+
+
+MAIN_MANIFEST = """<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+  <Configuration><Properties><Name>BASSmallBusiness</Name>
+  <ConfigurationExtensionCompatibilityMode>Version8_3_18</ConfigurationExtensionCompatibilityMode>
+  </Properties></Configuration>
 </MetaDataObject>
 """
 
@@ -72,6 +83,13 @@ def test_name_outside_properties_supported(tmp_path):
     assert discover_extension_roots(str(tmp_path)) == {
         "Mach3/extension": "ИнтеграцияMach3",
     }
+
+
+def test_wrapped_main_config_is_not_extension(tmp_path):
+    # Живой дамп: <dump>/1c-dump/Configuration.xml — основная конфигурация
+    # (без ConfigurationExtensionPurpose) в обёртке, а не расширение.
+    mk(tmp_path, "1c-dump/Configuration.xml", MAIN_MANIFEST)
+    assert discover_extension_roots(str(tmp_path)) == {}
 
 
 def test_main_config_manifest_not_returned(tmp_path):

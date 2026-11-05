@@ -102,6 +102,10 @@ def _manifest_name(cfg_path: str, reads_budget: list[int], root_real: str) -> st
                 break
     if cfg_elem is None:
         return ""
+    # Только у расширения есть ConfigurationExtensionPurpose: основная
+    # конфигурация в обёртке (<dump>/<каталог>/Configuration.xml) — не расширение.
+    if not any(local(e.tag) == "ConfigurationExtensionPurpose" for e in cfg_elem.iter()):
+        return ""
 
     name = ""
     for child in cfg_elem:
