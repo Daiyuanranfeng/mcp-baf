@@ -230,3 +230,22 @@ def test_warm_cache_added_file_under_nested_ext_root(tmp_path):
         assert matches[0].module == "ext.МоеРасширение.ОбщийМодуль.МодульРасш.Модуль"
     finally:
         idx.close()
+
+
+def test_warm_cache_rebuilds_when_ext_roots_change(tmp_path):
+    # Манифест добавлен к уже проиндексированным файлам: их ключи в кэше
+    # устарели, кэш должен перестроиться, а не отдавать path-ключи.
+    dump, cache = tmp_path / "dump", tmp_path / "cache"
+    mk_bsl(dump, "Обёртка/расш/CommonModules/М/Module.bsl", "Б = 2;")
+    idx = DumpIndex(str(dump), cache_dir=str(cache))
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    idx.close()
+
+    mk_manifest(dump, "Обёртка/расш", "Расш")
+    idx = DumpIndex(str(dump), cache_dir=str(cache))
+    assert idx.wait_ready(BUILD_TIMEOUT), idx.build_error()
+    try:
+        matches, _ = idx.search(SearchParams(query="Б = 2;", mode="exact"))
+        assert matches[0].module == "ext.Расш.ОбщийМодуль.М.Модуль"
+    finally:
+        idx.close()

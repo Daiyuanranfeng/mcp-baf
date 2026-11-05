@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -190,6 +191,9 @@ class DumpIndex:
         db.execute(
             "INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
         )
+        db.execute(
+            "INSERT INTO meta VALUES ('ext_roots', ?)", (self._ext_roots_key(),)
+        )
 
     def _walk_files(self) -> dict[str, _FileState]:
         """Собирает состояние всех .bsl файлов: rel_path -> (путь, mtime, size)."""
@@ -261,6 +265,9 @@ class DumpIndex:
             )
         self._db = db
 
+    def _ext_roots_key(self) -> str:
+        return json.dumps(self._ext_roots, sort_keys=True, ensure_ascii=False)
+
     def _open_cache_and_diff(self) -> None:
         """Открывает кэш и инкрементально применяет изменения файлов."""
         # Соединение сразу сохраняется в self._db: при любой ошибке ниже
@@ -272,6 +279,13 @@ class DumpIndex:
         ).fetchone()
         if version is None or int(version[0]) != SCHEMA_VERSION:
             raise RuntimeError(f"cache schema version mismatch: {version}")
+        # Имена модулей зависят от карты вложенных расширений: если манифест
+        # добавили/убрали/переименовали, ключи в кэше устарели целиком.
+        roots = db.execute(
+            "SELECT value FROM meta WHERE key = 'ext_roots'"
+        ).fetchone()
+        if roots is None or roots[0] != self._ext_roots_key():
+            raise RuntimeError("extension roots changed since cache was built")
 
         on_disk = self._walk_files()
         manifest = {
