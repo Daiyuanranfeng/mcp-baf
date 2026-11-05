@@ -223,3 +223,18 @@ def test_standard_dump_dirs_never_probed(tmp_path, caplog):
             mk(tmp_path, f"{std}/Объект{i}/Ext/Module.bsl", "А = 1;")
     assert discover_extension_roots(str(tmp_path)) == {}
     assert "спуск пропущен" not in caplog.text
+
+
+def test_symlinked_manifest_outside_dump_refused(tmp_path):
+    # Тот же контур, что у обхода индекса (PR #20): манифест-симлинк
+    # наружу dump-корня не читается.
+    dump = tmp_path / "dump"
+    mk(dump, "Configuration.xml", MANIFEST_TMPL.format(name="БАСМалыйБизнес"))
+    mk(dump, "Documents/ПеремещениеЗапасов/Ext/ObjectModule.bsl", "А = 1;")
+    outside = tmp_path / "outside" / "Configuration.xml"
+    outside.parent.mkdir(parents=True)
+    outside.write_text(MANIFEST_TMPL.format(name="Чужая"), encoding="utf-8")
+    ext_dir = dump / "Обёртка" / "расш"
+    ext_dir.mkdir(parents=True)
+    (ext_dir / "Configuration.xml").symlink_to(outside)
+    assert discover_extension_roots(str(dump)) == {}

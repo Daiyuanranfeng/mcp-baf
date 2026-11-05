@@ -62,8 +62,12 @@ STANDARD_DUMP_ROOT_DIRS = frozenset({
 })
 
 
-def _manifest_name(cfg_path: str, reads_budget: list[int]) -> str:
-    """Читает имя расширения из Configuration.xml (или '' при отказе)."""
+def _manifest_name(cfg_path: str, reads_budget: list[int], root_real: str) -> str:
+    """Читает имя расширения из Configuration.xml (или '' при отказе).
+
+    Манифесты-симлинки наружу dump-корня не читаются (тот же контур, что
+    у обхода индекса и find_form_files: выгрузку может принести извне).
+    """
     if reads_budget[0] <= 0:
         logger.warning(
             "extroots: бюджет чтений манифестов (%d) исчерпан — часть "
@@ -72,6 +76,9 @@ def _manifest_name(cfg_path: str, reads_budget: list[int]) -> str:
         )
         return ""
     reads_budget[0] -= 1
+    if not os.path.realpath(cfg_path).startswith(root_real + os.sep):
+        logger.warning("extroots: манифест %s ведёт за пределы dump-корня", cfg_path)
+        return ""
     try:
         root = parse_file(cfg_path)
     except (OSError, UnsafeXML) as exc:
@@ -134,6 +141,7 @@ def discover_extension_roots(dump_dir: str) -> dict[str, str]:
     """
     by_name: dict[str, list[str]] = {}  # имя расширения -> его rel-корни
     reads_budget = [MAX_MANIFEST_READS]
+    root_real = os.path.realpath(dump_dir)
 
     claimed = set()  # имена из path-конвенции Расширения/<каталог>/
     ext_root = os.path.join(dump_dir, EXTENSION_DIR_NAME)
@@ -146,7 +154,7 @@ def discover_extension_roots(dump_dir: str) -> dict[str, str]:
         child_abs = os.path.join(dump_dir, child)
         child_cfg = os.path.join(child_abs, CONFIG_FILE_NAME)
         if os.path.isfile(child_cfg):
-            name = _manifest_name(child_cfg, reads_budget)
+            name = _manifest_name(child_cfg, reads_budget, root_real)
             if name:
                 by_name.setdefault(name, []).append(nfc(child))
             continue
@@ -164,7 +172,7 @@ def discover_extension_roots(dump_dir: str) -> dict[str, str]:
                 continue
             grand_cfg = os.path.join(child_abs, grand, CONFIG_FILE_NAME)
             if os.path.isfile(grand_cfg):
-                name = _manifest_name(grand_cfg, reads_budget)
+                name = _manifest_name(grand_cfg, reads_budget, root_real)
                 if name:
                     by_name.setdefault(name, []).append(nfc(f"{child}/{grand}"))
 
