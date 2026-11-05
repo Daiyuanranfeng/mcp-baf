@@ -121,6 +121,14 @@ def test_collision_with_rasshireniya_convention_drops_nested(tmp_path):
     assert name == "ext.Честное.Документ.Х.МодульОбъекта"
 
 
+def test_collision_with_rasshireniya_convention_is_nfc(tmp_path):
+    # macOS отдаёт listdir в NFD, имя из манифеста — NFC: сравнение по NFC.
+    make_main_config(tmp_path)
+    (tmp_path / "Расширения" / "Йога").mkdir(parents=True)
+    mk_manifest(tmp_path, "Обёртка/поддельное", "Йога")
+    assert discover_extension_roots(str(tmp_path)) == {}
+
+
 def test_rasshireniya_subtree_not_probed(tmp_path):
     make_main_config(tmp_path)
     mk_manifest(tmp_path, "Расширения/МоеРасш", "ДругоеИмя")

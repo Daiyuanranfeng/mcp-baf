@@ -69,11 +69,13 @@ def _manifest_name(cfg_path: str, reads_budget: list[int], root_real: str) -> st
     у обхода индекса и find_form_files: выгрузку может принести извне).
     """
     if reads_budget[0] <= 0:
-        logger.warning(
-            "extroots: бюджет чтений манифестов (%d) исчерпан — часть "
-            "вложенных расширений может остаться без пространства имён",
-            MAX_MANIFEST_READS,
-        )
+        if reads_budget[0] == 0:  # предупреждаем один раз, а не на каждый пропуск
+            reads_budget[0] -= 1
+            logger.warning(
+                "extroots: бюджет чтений манифестов (%d) исчерпан — часть "
+                "вложенных расширений может остаться без пространства имён",
+                MAX_MANIFEST_READS,
+            )
         return ""
     reads_budget[0] -= 1
     if not os.path.realpath(cfg_path).startswith(root_real + os.sep):
@@ -106,9 +108,9 @@ def _manifest_name(cfg_path: str, reads_budget: list[int], root_real: str) -> st
         if local(child.tag) == "Properties":
             for sub in child:
                 if local(sub.tag) == "Name" and (sub.text or "").strip():
-                    return (sub.text or "").strip()
+                    return nfc((sub.text or "").strip())
         elif local(child.tag) == "Name" and (child.text or "").strip():
-            name = (child.text or "").strip()
+            name = nfc((child.text or "").strip())
     return name
 
 
@@ -146,7 +148,7 @@ def discover_extension_roots(dump_dir: str) -> dict[str, str]:
     claimed = set()  # имена из path-конвенции Расширения/<каталог>/
     ext_root = os.path.join(dump_dir, EXTENSION_DIR_NAME)
     if os.path.isdir(ext_root):
-        claimed.update(_list_dirs(ext_root))
+        claimed.update(nfc(n) for n in _list_dirs(ext_root))
 
     for child in _list_dirs(dump_dir):
         if _rejected_dir_name(child):
