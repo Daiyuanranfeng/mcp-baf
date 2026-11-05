@@ -76,6 +76,37 @@ SUBDIR_SEGMENT_NAMES = {
 # Корневая директория расширений конфигурации.
 EXTENSION_DIR_NAME = "Расширения"
 
+# Имена директорий выгрузки (англ. единственное и множественное число),
+# которые не могут быть каталогом расширения: манифест в Catalogs/ или
+# Documents/ — подделка или ошибка, а не расширение.
+CATEGORY_LIKE_DIR_NAMES = frozenset(
+    [singular for singular, _, _ in METADATA_TYPES]
+    + list(DUMP_DIR_NAMES)
+)
+
+
+def resolve_module_name(rel_path: str, ext_roots: dict[str, str] | None = None) -> str:
+    """Имя модуля с учётом вложенных кореньев расширений из ext_roots.
+
+    rel_path под каталогом ``Расширения/`` обрабатывается path-конвенцией
+    (bsl_path_to_module_name). Для остальных путей ищется самый длинный
+    префикс из ext_roots (rel_dir -> имя из Configuration.xml, см.
+    dumpindex.extroots): модули под таким корнем получают
+    ``ext.<имя>.``-пространство, остальная часть пути разбирается как у
+    основной конфигурации. Если префикс не найден или после него осталось
+    меньше двух сегментов — обычное поведение bsl_path_to_module_name.
+    """
+    parts = nfc(rel_path).replace("\\", "/").split("/")
+    if parts[0] != EXTENSION_DIR_NAME and ext_roots:
+        for depth in range(len(parts) - 1, 0, -1):
+            ext_name = ext_roots.get("/".join(parts[:depth]))
+            if ext_name is not None:
+                rest = parts[depth:]
+                if len(rest) >= 2:
+                    return f"ext.{ext_name}." + _base_config_module_name(rest)
+                break
+    return bsl_path_to_module_name(rel_path)
+
 
 def bsl_path_to_module_name(rel_path: str) -> str:
     """Преобразует относительный путь .bsl файла в имя модуля.
