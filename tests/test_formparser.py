@@ -192,3 +192,50 @@ def test_find_form_files_skips_symlink_outside_dump(tmp_path):
     ext.mkdir(parents=True)
     (ext / "Form.xml").symlink_to(outside)
     assert formparser.find_form_files(str(dump), "Catalog", "Тест") == {}
+
+
+def test_find_form_files_rejects_ambiguous_nfc_collision(tmp_path):
+    # Два разных файла с диска (NFC «Й» и NFD «И»+combining) сошлись в
+    # одно NFC-имя: молча выбрать один — показать чужую форму.
+    forms = tmp_path / "Catalogs" / "Тест" / "Forms"
+    for raw in ("ФормаЙ", "ФормаИ\u0306"):
+        p = forms / raw / "Ext" / "Form.xml"
+        p.parent.mkdir(parents=True)
+        p.write_text("<Form/>", encoding="utf-8")
+    with pytest.raises(ValueError, match="ambiguous form names"):
+        formparser.find_form_files(str(tmp_path), "Catalog", "Тест")
+
+
+def test_parse_form_xml_data_rejects_dtd():
+    # Выгрузка 1С не содержит DTD; документ с DTD/сущностями отвергается
+    # целиком (аналог «refuse unsupported» из feenlace/mcp-1c).
+    with pytest.raises(ValueError, match="DTD"):
+        formparser.parse_form_xml_data(
+            '<!DOCTYPE Form [<!ENTITY a "x">]><Form><Title>&a;</Title></Form>'
+        )
+
+
+def test_parse_form_xml_rejects_dtd_file(tmp_path):
+    p = tmp_path / "Form.xml"
+    p.write_text(
+        '<?xml version="1.0"?>\n<!DOCTYPE Form [<!ENTITY a "x">]>\n'
+        "<Form><Title>&a;</Title></Form>",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="DTD"):
+        formparser.parse_form_xml(str(p))
+
+
+def test_parse_form_xml_accepts_plain_declaration(tmp_path):
+    # Штатная выгрузка начинается с XML-декларации — guard её не трогает.
+    p = tmp_path / "Form.xml"
+    p.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Form xmlns="http://v8.1c.ru/8.3/xcf/logform">'
+        "<ChildItems>"
+        '<InputField name="Поле1"><DataPath>Объект.Поле1</DataPath></InputField>'
+        "</ChildItems></Form>",
+        encoding="utf-8",
+    )
+    info = formparser.parse_form_xml(str(p))
+    assert [e.name for e in info.elements] == ["Поле1"]
