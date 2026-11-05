@@ -4,6 +4,7 @@
 скопированные из dump/testdata Go-версии; ожидания — из dump/formparser_test.go.
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -198,12 +199,25 @@ def test_find_form_files_rejects_ambiguous_nfc_collision(tmp_path):
     # Два разных файла с диска (NFC «Й» и NFD «И»+combining) сошлись в
     # одно NFC-имя: молча выбрать один — показать чужую форму.
     forms = tmp_path / "Catalogs" / "Тест" / "Forms"
-    for raw in ("ФормаЙ", "ФормаИ\u0306"):
+    forms.mkdir(parents=True)
+    names = ("ФормаЙ", "ФормаИ\u0306")
+    for raw in names:
+        (forms / raw).mkdir(exist_ok=True)
+    if len(os.listdir(forms)) < len(names):
+        pytest.skip("ФС склеивает NFC/NFD-имена (APFS): коллизия невозможна")
+    for raw in names:
         p = forms / raw / "Ext" / "Form.xml"
-        p.parent.mkdir(parents=True)
+        p.parent.mkdir()
         p.write_text("<Form/>", encoding="utf-8")
     with pytest.raises(ValueError, match="ambiguous form names"):
         formparser.find_form_files(str(tmp_path), "Catalog", "Тест")
+
+
+def test_parse_form_xml_data_rejects_utf16():
+    # Байтовый guard не видит маркеры в UTF-16 — такой вход отвергается.
+    data = '<!DOCTYPE Form [<!ENTITY a "x">]><Form/>'.encode("utf-16")
+    with pytest.raises(ValueError, match="UTF-16"):
+        formparser.parse_form_xml_data(data)
 
 
 def test_parse_form_xml_data_rejects_dtd():

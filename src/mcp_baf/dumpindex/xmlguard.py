@@ -38,7 +38,11 @@ def guard(data: bytes) -> bytes:
         raise UnsafeXML(
             f"XML слишком большой ({len(data)} байт > {MAX_XML_BYTES})"
         )
-    lowered = data[: MAX_XML_BYTES].lower()
+    # Байтовый поиск маркеров работает только для ASCII-совместимых кодировок;
+    # выгрузка 1С всегда UTF-8, а UTF-16 (BOM или NUL в начале) пропустил бы DTD.
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in data[:4]:
+        raise UnsafeXML("XML в UTF-16 не поддерживается; выгрузка 1С — UTF-8")
+    lowered = data.lower()
     for marker in _FORBIDDEN_MARKERS:
         if marker in lowered:
             raise UnsafeXML(
@@ -56,4 +60,5 @@ def parse_bytes(data: bytes) -> ET.Element:
 def parse_file(path: str) -> ET.Element:
     """Читает файл и разбирает его с проверкой guard()."""
     with open(path, "rb") as f:
-        return parse_bytes(f.read())
+        # +1 байт: guard() увидит превышение, не читая огромный файл целиком.
+        return parse_bytes(f.read(MAX_XML_BYTES + 1))
