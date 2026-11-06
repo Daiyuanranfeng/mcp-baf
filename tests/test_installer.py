@@ -353,15 +353,30 @@ def test_dump_base_only_single_call(monkeypatch, tmp_path):
     assert calls == [("1cv8.exe", "C:\\db", False, "", "", "/DumpConfigToFiles", out)]
 
 
-def test_dump_all_extensions_one_call_no_separate_base(monkeypatch, tmp_path):
-    calls, fake = _recorder()
+def test_dump_all_extensions_base_then_moved_subdirs(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    (out / "A").mkdir(parents=True)
+    (out / "A" / "stale.bsl").write_text("old")
+    calls = []
+
+    def fake(platform_exe, db_path, server_mode, db_user, db_password, *extra):
+        calls.append(extra)
+        if "-AllExtensions" in extra:  # платформа кладёт расширения в подпапки
+            for name in ("A", "Catalogs"):
+                os.makedirs(os.path.join(extra[1], name))
+                open(os.path.join(extra[1], name, "Configuration.xml"), "w").close()
+        return None
+
     monkeypatch.setattr(installer, "_run_designer", fake)
-    installer.dump("srv\\b", str(tmp_path / "out"), extensions="all",
-                   server_mode=True, db_user="u", db_password="p",
-                   platform_exe="1cv8.exe")
-    out = str(os.path.abspath(str(tmp_path / "out")))
-    assert calls == [("1cv8.exe", "srv\\b", True, "u", "p",
-                      "/DumpConfigToFiles", out, "-AllExtensions")]
+    result = installer.dump("srv\\b", str(out), extensions="all", platform_exe="1cv8.exe")
+    assert calls[0] == ("/DumpConfigToFiles", str(out))  # основа — отдельно и первой
+    assert calls[1][0] == "/DumpConfigToFiles" and calls[1][2] == "-AllExtensions"
+    assert calls[1][1] != str(out)  # расширения — во временный каталог
+    assert not os.path.exists(calls[1][1])  # временный каталог убран
+    assert (out / "A" / "Configuration.xml").exists()
+    assert not (out / "A" / "stale.bsl").exists()
+    assert not (out / "Catalogs").exists()  # не затирает каталог основы
+    assert result["extensions"]["A"] is None and result["extensions"]["Catalogs"]
 
 
 def test_dump_specific_extensions_into_subdirs(monkeypatch, tmp_path):
@@ -382,11 +397,21 @@ def test_dump_specific_extensions_into_subdirs(monkeypatch, tmp_path):
 def test_dump_rejects_path_in_extension_name(monkeypatch, tmp_path):
     calls, fake = _recorder()
     monkeypatch.setattr(installer, "_run_designer", fake)
-    for bad in ("../evil", "a/b", "a\\b", ""):
+    for bad in ("../evil", "a/b", "a\\b", "", ".", "..", "x.", "a:b", "a?b",
+                "Catalogs", "Ext", "CommonModules", ".hidden"):
         with pytest.raises(installer.InstallError):
             installer.dump("C:\\db", str(tmp_path / "o"), extensions=[bad],
                            platform_exe="1cv8.exe")
     assert calls == []  # перевірка імен — до будь-якого виклику DESIGNER
+
+
+def test_dump_dedupes_extension_names_case_insensitive(monkeypatch, tmp_path):
+    calls, fake = _recorder()
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    result = installer.dump("C:\\db", str(tmp_path / "o"), extensions=["A", "B", "a"],
+                            platform_exe="1cv8.exe")
+    assert len(calls) == 3  # основа + A + B
+    assert len(result["extensions"]) == 2
 
 
 def test_dump_base_failure_raises(monkeypatch, tmp_path):

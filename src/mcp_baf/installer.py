@@ -204,9 +204,17 @@ def install(
 
 
 def _safe_extension_name(name: str) -> str:
-    """Имя расширения из CLI: без путей — оно становится подкаталогом выгрузки."""
+    """Имя расширения из CLI: без путей — оно становится подкаталогом выгрузки.
+
+    Отклоняются и имена, которые индексатор не примет за корень расширения
+    (стандартные каталоги выгрузки вроде Catalogs/Ext, скрытые, «.»/«..»):
+    выгрузка в такой подкаталог смешалась бы с файлами основной конфигурации.
+    """
+    from mcp_baf.dumpindex.extroots import _rejected_dir_name
+
     name = (name or "").strip()
-    if not name or "/" in name or "\\" in name or ".." in name:
+    if (not name or re.search(r'[\\/<>:"|?*\x00-\x1f]', name)
+            or name.endswith(".") or _rejected_dir_name(name)):
         raise InstallError(f"некоректне ім'я розширення: {name!r}")
     return name
 
@@ -224,9 +232,9 @@ def dump(
     """Выгружает конфигурацию из базы DESIGNER /DumpConfigToFiles в out_dir.
 
     extensions=None — только основная конфигурация;
-    extensions="all" — основная и все расширения одной командой
-        -AllExtensions (платформа сама кладёт каждое расширение в
-        подпапку <out_dir>/<имя>/);
+    extensions="all" — основная, затем все расширения командой
+        -AllExtensions (основу она не выгружает) во временный каталог,
+        откуда каждое переносится в подпапку <out_dir>/<имя>/;
     extensions=[...] — основная плюс каждое указанное расширение
         отдельной командой -Extension в свою подпапку <out_dir>/<имя>/
         (без флага -Extension подпапка обязательна: платформа пишет
@@ -242,7 +250,9 @@ def dump(
     при ошибке выгрузки основной конфигурации бросает InstallError —
     без неё искать нечего.
     """
-    names = [_safe_extension_name(n) for n in (extensions or [])] \
+    # Имена расширений в 1С регистронезависимы — дубль означал бы повторную выгрузку.
+    names = list({_safe_extension_name(n).casefold(): _safe_extension_name(n)
+                  for n in (extensions or [])}.values()) \
         if not isinstance(extensions, str) else []
     if isinstance(extensions, str) and extensions != "all":
         raise InstallError(f"--dump-extensions: ожидалось 'all' або список, отримано {extensions!r}")
@@ -260,22 +270,38 @@ def dump(
 
     result: dict = {"base_error": None, "extensions": {}}
 
-    if extensions == "all":
-        print(f"Експорт конфігурації та всіх розширень: {out_dir}")
-        result["base_error"] = run("/DumpConfigToFiles", out_dir, "-AllExtensions")
-        if result["base_error"]:
-            raise InstallError(
-                f"DumpConfigToFiles -AllExtensions: {result['base_error']}")
-        return result
-
-    print(f"Експорт конфігурації: {out_dir}")
+    print(f"Exporting configuration (may take several minutes): {out_dir}")
     result["base_error"] = run("/DumpConfigToFiles", out_dir)
     if result["base_error"]:
         raise InstallError(f"DumpConfigToFiles: {result['base_error']}")
 
+    if extensions == "all":
+        # -AllExtensions выгружает только расширения (основу — нет, проверено
+        # на 8.3.18). Во временный каталог: не зависим от того, чистит ли
+        # DESIGNER цель, и не даём расширению затереть каталог основы.
+        tmp = tempfile.mkdtemp(prefix="mcp-baf-ext-")
+        try:
+            print("Exporting all extensions...")
+            err = run("/DumpConfigToFiles", tmp, "-AllExtensions")
+            if err:
+                raise InstallError(f"DumpConfigToFiles -AllExtensions: {err}")
+            for name in sorted(os.listdir(tmp)):
+                try:
+                    _safe_extension_name(name)
+                except InstallError as exc:
+                    result["extensions"][name] = str(exc)
+                    continue
+                dst = os.path.join(out_dir, name)
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.move(os.path.join(tmp, name), dst)
+                result["extensions"][name] = None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return result
+
     for name in names:
         ext_dir = os.path.join(out_dir, name)
-        print(f"Експорт розширення: {name} -> {ext_dir}")
+        print(f"Exporting extension: {name} -> {ext_dir}")
         result["extensions"][name] = run(
             "/DumpConfigToFiles", ext_dir, "-Extension", name)
     return result
