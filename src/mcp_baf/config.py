@@ -125,7 +125,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dump", default="",
-        help="Path to DumpConfigToFiles output (enables search_code)",
+        help="Path to DumpConfigToFiles output (enables search_code). "
+             "With --install: also export the database (and extensions via "
+             "--dump-extensions) to this directory after installing.",
+    )
+    parser.add_argument(
+        "--dump-extensions", default=None, metavar="all|NAME[,...]", nargs="?",
+        const="all",
+        help="With --install --dump: also export extensions into <dump>/<name>/ "
+             "subdirectories - flag alone or 'all' for every extension, or a "
+             "comma-separated list of names; omitted - main configuration only",
     )
     parser.add_argument(
         "--cache-dir", default="",

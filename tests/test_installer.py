@@ -330,3 +330,145 @@ def test_normalize_names_nfc(tmp_path):
     installer.normalize_names_nfc(str(tmp_path))
     names = [n for _root, dirs, files in os.walk(tmp_path) for n in dirs + files]
     assert names and all(n == unicodedata.normalize("NFC", n) for n in names)
+
+
+# ── dump(): експорт конфігурації та розширень ──
+
+def _recorder():
+    calls = []
+
+    def fake(platform_exe, db_path, server_mode, db_user, db_password, *extra):
+        calls.append((platform_exe, db_path, server_mode, db_user, db_password, *extra))
+        return None
+
+    return calls, fake
+
+
+def test_dump_base_only_single_call(monkeypatch, tmp_path):
+    calls, fake = _recorder()
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    result = installer.dump("C:\\db", str(tmp_path / "out"), platform_exe="1cv8.exe")
+    out = str(os.path.abspath(str(tmp_path / "out")))
+    assert result == {"base_error": None, "extensions": {}}
+    assert calls == [("1cv8.exe", "C:\\db", False, "", "", "/DumpConfigToFiles", out)]
+
+
+def test_dump_all_extensions_base_then_moved_subdirs(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    (out / "A").mkdir(parents=True)
+    (out / "A" / "stale.bsl").write_text("old")
+    calls = []
+
+    def fake(platform_exe, db_path, server_mode, db_user, db_password, *extra):
+        calls.append(extra)
+        if "-AllExtensions" in extra:  # платформа кладёт расширения в подпапки
+            for name in ("A", "Catalogs"):
+                os.makedirs(os.path.join(extra[1], name))
+                open(os.path.join(extra[1], name, "Configuration.xml"), "w").close()
+        return None
+
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    result = installer.dump("srv\\b", str(out), extensions="all", platform_exe="1cv8.exe")
+    assert calls[0] == ("/DumpConfigToFiles", str(out))  # основа — отдельно и первой
+    assert calls[1][0] == "/DumpConfigToFiles" and calls[1][2] == "-AllExtensions"
+    assert calls[1][1] != str(out)  # расширения — во временный каталог
+    assert not os.path.exists(calls[1][1])  # временный каталог убран
+    assert (out / "A" / "Configuration.xml").exists()
+    assert not (out / "A" / "stale.bsl").exists()
+    assert not (out / "Catalogs").exists()  # не затирает каталог основы
+    assert result["extensions"]["A"] is None and result["extensions"]["Catalogs"]
+
+
+def test_dump_specific_extensions_into_subdirs(monkeypatch, tmp_path):
+    calls, fake = _recorder()
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    out = str(tmp_path / "out")
+    installer.dump("C:\\db", out, extensions=["MCP_HTTPService", "ЧестныйЗнак"],
+                   platform_exe="1cv8.exe")
+    assert len(calls) == 3
+    base, e1, e2 = calls
+    assert base[-2:] == ("/DumpConfigToFiles", os.path.abspath(out))
+    assert e1[-4:] == ("/DumpConfigToFiles", os.path.join(os.path.abspath(out), "MCP_HTTPService"),
+                       "-Extension", "MCP_HTTPService")
+    assert e2[-4:] == ("/DumpConfigToFiles", os.path.join(os.path.abspath(out), "ЧестныйЗнак"),
+                       "-Extension", "ЧестныйЗнак")
+
+
+def test_dump_rejects_path_in_extension_name(monkeypatch, tmp_path):
+    calls, fake = _recorder()
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    for bad in ("../evil", "a/b", "a\\b", "", ".", "..", "x.", "a:b", "a?b",
+                "Catalogs", "Ext", "CommonModules", ".hidden"):
+        with pytest.raises(installer.InstallError):
+            installer.dump("C:\\db", str(tmp_path / "o"), extensions=[bad],
+                           platform_exe="1cv8.exe")
+    assert calls == []  # перевірка імен — до будь-якого виклику DESIGNER
+
+
+def test_dump_dedupes_extension_names_case_insensitive(monkeypatch, tmp_path):
+    calls, fake = _recorder()
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    result = installer.dump("C:\\db", str(tmp_path / "o"), extensions=["A", "B", "a"],
+                            platform_exe="1cv8.exe")
+    assert len(calls) == 3  # основа + A + B
+    assert len(result["extensions"]) == 2
+
+
+def test_dump_base_failure_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(installer, "_run_designer",
+                        lambda *a, **k: "DESIGNER failed (exit code 1)")
+    with pytest.raises(installer.InstallError, match="DumpConfigToFiles"):
+        installer.dump("C:\\db", str(tmp_path / "o"), platform_exe="1cv8.exe")
+
+
+def test_dump_extension_failure_collected_others_continue(monkeypatch, tmp_path):
+    def fake(platform_exe, db_path, server_mode, db_user, db_password, *extra):
+        return "boom" if extra[-1] == "Біле" else None
+
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    result = installer.dump("C:\\db", str(tmp_path / "o"),
+                            extensions=["Здорове", "Біле"], platform_exe="1cv8.exe")
+    assert result["extensions"] == {"Здорове": None, "Біле": "boom"}
+
+
+def test_dump_rejects_unknown_string_extensions(monkeypatch, tmp_path):
+    monkeypatch.setattr(installer, "_run_designer", lambda *a, **k: None)
+    with pytest.raises(installer.InstallError, match="all"):
+        installer.dump("C:\\db", str(tmp_path / "o"), extensions="some",
+                       platform_exe="1cv8.exe")
+
+
+def test_dump_all_skips_root_files_and_blocked_target(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+
+    def fake(platform_exe, db_path, server_mode, db_user, db_password, *extra):
+        if "-AllExtensions" in extra:
+            root = extra[1]
+            for name in ("A", "B"):
+                os.makedirs(os.path.join(root, name))
+                open(os.path.join(root, name, "Configuration.xml"), "w").close()
+            open(os.path.join(root, "ConfigDumpInfo.xml"), "w").close()
+        return None
+
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    (out / "B").mkdir(parents=True)
+    (out / "B" / "stale.bsl").write_text("locked-by-av")
+
+    real_rmtree = installer.shutil.rmtree
+
+    def blocked(path, *a, **kw):
+        # «B» не видаляється: імітація заблокованого антивірусом каталогу
+        if os.path.basename(str(path)) == "B":
+            return
+        real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(installer.shutil, "rmtree", blocked)
+    result = installer.dump("srv\\b", str(out), extensions="all", platform_exe="1cv8.exe")
+    assert result["extensions"]["A"] is None
+    assert (out / "A" / "Configuration.xml").exists()
+    # заблокована ціль — зібрана помилка, без тихого вкладення B/B
+    assert result["extensions"]["B"] and "could not be removed" in result["extensions"]["B"]
+    assert not (out / "B" / "B").exists()
+    # службовий файл з кореня вивантажки не «розширення»
+    assert "ConfigDumpInfo.xml" not in result["extensions"]
+    assert not (out / "ConfigDumpInfo.xml").exists()

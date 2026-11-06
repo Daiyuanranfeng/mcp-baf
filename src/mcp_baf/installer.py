@@ -203,6 +203,120 @@ def install(
         shutil.rmtree(ext_dir, ignore_errors=True)
 
 
+def _safe_extension_name(name: str) -> str:
+    """Имя расширения из CLI: без путей — оно становится подкаталогом выгрузки.
+
+    Отклоняются и имена, которые индексатор не примет за корень расширения
+    (стандартные каталоги выгрузки вроде Catalogs/Ext, скрытые, «.»/«..»):
+    выгрузка в такой подкаталог смешалась бы с файлами основной конфигурации.
+    """
+    from mcp_baf.dumpindex.extroots import _rejected_dir_name
+
+    name = (name or "").strip()
+    if (not name or re.search(r'[\\/<>:"|?*\x00-\x1f]', name)
+            or name.endswith(".") or _rejected_dir_name(name)):
+        raise InstallError(f"некоректне ім'я розширення: {name!r}")
+    return name
+
+
+def dump(
+    db_path: str,
+    out_dir: str,
+    extensions: "list[str] | str | None" = None,
+    server_mode: bool = False,
+    platform_exe: str = "",
+    db_user: str = "",
+    db_password: str = "",
+    platform_version: str = "",
+) -> dict:
+    """Выгружает конфигурацию из базы DESIGNER /DumpConfigToFiles в out_dir.
+
+    extensions=None — только основная конфигурация;
+    extensions="all" — основная, затем все расширения командой
+        -AllExtensions (основу она не выгружает) во временный каталог,
+        откуда каждое переносится в подпапку <out_dir>/<имя>/;
+    extensions=[...] — основная плюс каждое указанное расширение
+        отдельной командой -Extension в свою подпапку <out_dir>/<имя>/
+        (без флага -Extension подпапка обязательна: платформа пишет
+        выгрузку расширения её собственным Configuration.xml в корень
+        целевого каталога).
+
+    Подпапки расширений индексатор (dumpindex.extroots) распознаёт по
+    ConfigurationExtensionPurpose — код сразу виден в search_code как
+    ext.<имя>.*. Имена расширений валидируются заранее: они становятся
+    именами подкаталогов.
+
+    Возвращает {"base_error": str|None, "extensions": {имя: str|None}};
+    при ошибке выгрузки основной конфигурации бросает InstallError —
+    без неё искать нечего.
+    """
+    # Имена расширений в 1С регистронезависимы — дубль означал бы повторную выгрузку.
+    names = list({_safe_extension_name(n).casefold(): _safe_extension_name(n)
+                  for n in (extensions or [])}.values()) \
+        if not isinstance(extensions, str) else []
+    if isinstance(extensions, str) and extensions != "all":
+        raise InstallError(f"--dump-extensions: ожидалось 'all' або список, отримано {extensions!r}")
+
+    if not platform_exe:
+        platform_exe = find_platform()
+    print(f"Platform: {platform_exe}")
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    def run(*extra: str) -> str | None:
+        return _run_designer(
+            platform_exe, db_path, server_mode, db_user, db_password, *extra
+        )
+
+    result: dict = {"base_error": None, "extensions": {}}
+
+    print(f"Exporting configuration (may take several minutes): {out_dir}")
+    result["base_error"] = run("/DumpConfigToFiles", out_dir)
+    if result["base_error"]:
+        raise InstallError(f"DumpConfigToFiles: {result['base_error']}")
+
+    if extensions == "all":
+        # -AllExtensions выгружает только расширения (основу — нет, проверено
+        # на 8.3.18). Во временный каталог: не зависим от того, чистит ли
+        # DESIGNER цель, и не даём расширению затереть каталог основы.
+        tmp = tempfile.mkdtemp(prefix="mcp-baf-ext-")
+        try:
+            print("Exporting all extensions...")
+            err = run("/DumpConfigToFiles", tmp, "-AllExtensions")
+            if err:
+                raise InstallError(f"DumpConfigToFiles -AllExtensions: {err}")
+            for name in sorted(os.listdir(tmp)):
+                src = os.path.join(tmp, name)
+                if not os.path.isdir(src):
+                    continue  # ConfigDumpInfo.xml та службове з кореня вивантажки
+                try:
+                    _safe_extension_name(name)
+                except InstallError as exc:
+                    result["extensions"][name] = str(exc)
+                    continue
+                dst = os.path.join(out_dir, name)
+                shutil.rmtree(dst, ignore_errors=True)
+                if os.path.exists(dst):
+                    # Заблокований антивірусом каталог-жертва: shutil.move
+                    # інакше мовчки запхав би джерело всередину нього.
+                    result["extensions"][name] = (
+                        f"target directory {dst} exists and could not be removed"
+                        " (locked by another process?)")
+                    continue
+                shutil.move(src, dst)
+                result["extensions"][name] = None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return result
+
+    for name in names:
+        ext_dir = os.path.join(out_dir, name)
+        print(f"Exporting extension: {name} -> {ext_dir}")
+        result["extensions"][name] = run(
+            "/DumpConfigToFiles", ext_dir, "-Extension", name)
+    return result
+
+
 def _install_from(
     ext_dir: str,
     platform_exe: str,

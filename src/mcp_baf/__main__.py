@@ -58,6 +58,50 @@ def _setup_logging(debug: bool, cache_dir: str) -> None:
     root.addHandler(file_handler)
 
 
+def _parse_dump_extensions(raw: str | None) -> "list[str] | str | None":
+    """--dump-extensions: не задан — None (только основная конфигурация);
+    без значения или «all» — "all"; иначе — проверенный список имён.
+
+    Вызывается до установки, чтобы опечатка в именах не стоила полной установки.
+    """
+    if raw is None:
+        return None
+    if raw.strip().lower() == "all":
+        return "all"
+    from mcp_baf import installer
+
+    names = [installer._safe_extension_name(s) for s in raw.split(",") if s.strip()]
+    if not names:
+        raise installer.InstallError("--dump-extensions: порожній список розширень")
+    return names
+
+
+def _run_dump(args, extensions: "list[str] | str | None") -> None:
+    """Экспорт конфигурации после установки (mcp-baf --install ... --dump DIR)."""
+    from mcp_baf import installer
+
+    try:
+        summary = installer.dump(
+            db_path=args.install,
+            out_dir=args.dump,
+            extensions=extensions,
+            server_mode=args.server,
+            platform_exe=args.platform,
+            db_user=args.db_user,
+            db_password=args.db_password,
+            platform_version=args.platform_version,
+        )
+    except installer.InstallError as exc:
+        print(f"Dump error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    failed = sorted(n for n, err in summary["extensions"].items() if err)
+    if failed:
+        print(f"Export completed with failed extensions: {', '.join(failed)}",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Configuration exported to {args.dump}")
+
+
 def main() -> None:
     args = parse_args()
     try:
@@ -67,10 +111,23 @@ def main() -> None:
         sys.exit(1)
     _setup_logging(config.debug, config.cache_dir)
 
+    if args.dump_extensions is not None and not (args.install and args.dump):
+        print("--dump-extensions requires --install and --dump", file=sys.stderr)
+        sys.exit(1)
+
     # Режим установки расширения.
     if args.install:
         from mcp_baf import installer
 
+        # При перенаправлении вывода Windows даёт stdout в cp1252: кириллица
+        # (имена расширений, пути, лог DESIGNER) иначе роняет уже после установки.
+        sys.stdout.reconfigure(errors="backslashreplace")
+        sys.stderr.reconfigure(errors="backslashreplace")
+        try:
+            dump_extensions = _parse_dump_extensions(args.dump_extensions)
+        except installer.InstallError as exc:
+            print(f"Dump error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print("Installing MCP extension into 1C database...")
         try:
             installer.install(
@@ -86,6 +143,8 @@ def main() -> None:
             print(f"Installation error: {exc}", file=sys.stderr)
             sys.exit(1)
         print("Extension installed successfully.")
+        if args.dump:
+            _run_dump(args, dump_extensions)
         return
 
     # Установка расширения, --help и --version не зависят от API MCP SDK.

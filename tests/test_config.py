@@ -99,3 +99,13 @@ def test_password_missing_file_error_names_variable_and_path(monkeypatch, tmp_pa
 def test_base_url_with_credentials_rejected():
     with pytest.raises(ConfigError, match="--user"):
         load_config(parse_args(["--base", "http://u:secret@host/hs/mcp-baf"]))
+
+
+def test_dump_extensions_flag_forms():
+    a = parse_args(["--install", "db", "--dump", "/x"])
+    assert a.dump == "/x"
+    assert a.dump_extensions is None
+    a = parse_args(["--install", "db", "--dump", "/x", "--dump-extensions"])
+    assert a.dump_extensions == "all"
+    a = parse_args(["--install", "db", "--dump", "/x", "--dump-extensions", "A,B"])
+    assert a.dump_extensions == "A,B"
