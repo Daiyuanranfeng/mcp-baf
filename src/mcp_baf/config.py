@@ -130,11 +130,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "--dump-extensions) to this directory after installing.",
     )
     parser.add_argument(
-        "--dump-extensions", default=None, metavar="all|ІМЯ[,...]", nargs="?",
+        "--dump-extensions", default=None, metavar="all|NAME[,...]", nargs="?",
         const="all",
-        help="With --install --dump: 'all' extensions (single -AllExtensions "
-             "call) or a comma-separated list of extension names exported "
-             "into subdirectories; omitted — main configuration only",
+        help="With --install --dump: also export extensions into <dump>/<name>/ "
+             "subdirectories - flag alone or 'all' for every extension, or a "
+             "comma-separated list of names; omitted - main configuration only",
     )
     parser.add_argument(
         "--cache-dir", default="",
