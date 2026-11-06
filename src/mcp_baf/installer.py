@@ -286,6 +286,9 @@ def dump(
             if err:
                 raise InstallError(f"DumpConfigToFiles -AllExtensions: {err}")
             for name in sorted(os.listdir(tmp)):
+                src = os.path.join(tmp, name)
+                if not os.path.isdir(src):
+                    continue  # ConfigDumpInfo.xml та службове з кореня вивантажки
                 try:
                     _safe_extension_name(name)
                 except InstallError as exc:
@@ -293,7 +296,14 @@ def dump(
                     continue
                 dst = os.path.join(out_dir, name)
                 shutil.rmtree(dst, ignore_errors=True)
-                shutil.move(os.path.join(tmp, name), dst)
+                if os.path.exists(dst):
+                    # Заблокований антивірусом каталог-жертва: shutil.move
+                    # інакше мовчки запхав би джерело всередину нього.
+                    result["extensions"][name] = (
+                        f"target directory {dst} exists and could not be removed"
+                        " (locked by another process?)")
+                    continue
+                shutil.move(src, dst)
                 result["extensions"][name] = None
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

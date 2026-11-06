@@ -122,6 +122,7 @@ def main() -> None:
         # При перенаправлении вывода Windows даёт stdout в cp1252: кириллица
         # (имена расширений, пути, лог DESIGNER) иначе роняет уже после установки.
         sys.stdout.reconfigure(errors="backslashreplace")
+        sys.stderr.reconfigure(errors="backslashreplace")
         try:
             dump_extensions = _parse_dump_extensions(args.dump_extensions)
         except installer.InstallError as exc:

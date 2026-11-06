@@ -436,3 +436,39 @@ def test_dump_rejects_unknown_string_extensions(monkeypatch, tmp_path):
     with pytest.raises(installer.InstallError, match="all"):
         installer.dump("C:\\db", str(tmp_path / "o"), extensions="some",
                        platform_exe="1cv8.exe")
+
+
+def test_dump_all_skips_root_files_and_blocked_target(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+
+    def fake(platform_exe, db_path, server_mode, db_user, db_password, *extra):
+        if "-AllExtensions" in extra:
+            root = extra[1]
+            for name in ("A", "B"):
+                os.makedirs(os.path.join(root, name))
+                open(os.path.join(root, name, "Configuration.xml"), "w").close()
+            open(os.path.join(root, "ConfigDumpInfo.xml"), "w").close()
+        return None
+
+    monkeypatch.setattr(installer, "_run_designer", fake)
+    (out / "B").mkdir(parents=True)
+    (out / "B" / "stale.bsl").write_text("locked-by-av")
+
+    real_rmtree = installer.shutil.rmtree
+
+    def blocked(path, *a, **kw):
+        # «B» не видаляється: імітація заблокованого антивірусом каталогу
+        if os.path.basename(str(path)) == "B":
+            return
+        real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(installer.shutil, "rmtree", blocked)
+    result = installer.dump("srv\\b", str(out), extensions="all", platform_exe="1cv8.exe")
+    assert result["extensions"]["A"] is None
+    assert (out / "A" / "Configuration.xml").exists()
+    # заблокована ціль — зібрана помилка, без тихого вкладення B/B
+    assert result["extensions"]["B"] and "could not be removed" in result["extensions"]["B"]
+    assert not (out / "B" / "B").exists()
+    # службовий файл з кореня вивантажки не «розширення»
+    assert "ConfigDumpInfo.xml" not in result["extensions"]
+    assert not (out / "ConfigDumpInfo.xml").exists()
