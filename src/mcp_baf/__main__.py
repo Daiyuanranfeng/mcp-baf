@@ -58,6 +58,41 @@ def _setup_logging(debug: bool, cache_dir: str) -> None:
     root.addHandler(file_handler)
 
 
+def _run_dump(args) -> None:
+    """Экспорт конфигурации после установки (mcp-baf --install ... --dump DIR).
+
+    --dump-extensions: не задан — только основная конфигурация; задан без
+    значения — «all»; значение — список имён через запятую.
+    """
+    from mcp_baf import installer
+
+    extensions = None
+    if args.dump_extensions is not None:
+        extensions = args.dump_extensions  # "all" или сырая строка списка
+        if extensions != "all":
+            extensions = [p for p in (s.strip() for s in extensions.split(",")) if p]
+    try:
+        summary = installer.dump(
+            db_path=args.install,
+            out_dir=args.dump,
+            extensions=extensions,
+            server_mode=args.server,
+            platform_exe=args.platform,
+            db_user=args.db_user,
+            db_password=args.db_password,
+            platform_version=args.platform_version,
+        )
+    except installer.InstallError as exc:
+        print(f"Dump error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    failed = sorted(n for n, err in summary["extensions"].items() if err)
+    if failed:
+        print(f"Export completed with failed extensions: {', '.join(failed)}",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Configuration exported to {args.dump}")
+
+
 def main() -> None:
     args = parse_args()
     try:
@@ -86,7 +121,13 @@ def main() -> None:
             print(f"Installation error: {exc}", file=sys.stderr)
             sys.exit(1)
         print("Extension installed successfully.")
+        if args.dump:
+            _run_dump(args)
         return
+
+    if args.dump_extensions is not None and not (args.install and args.dump):
+        print("--dump-extensions requires --install and --dump", file=sys.stderr)
+        sys.exit(1)
 
     # Установка расширения, --help и --version не зависят от API MCP SDK.
     from mcp_baf.server import create_server

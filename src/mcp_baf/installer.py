@@ -203,6 +203,84 @@ def install(
         shutil.rmtree(ext_dir, ignore_errors=True)
 
 
+def _safe_extension_name(name: str) -> str:
+    """Имя расширения из CLI: без путей — оно становится подкаталогом выгрузки."""
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise InstallError(f"некоректне ім'я розширення: {name!r}")
+    return name
+
+
+def dump(
+    db_path: str,
+    out_dir: str,
+    extensions: "list[str] | str | None" = None,
+    server_mode: bool = False,
+    platform_exe: str = "",
+    db_user: str = "",
+    db_password: str = "",
+    platform_version: str = "",
+) -> dict:
+    """Выгружает конфигурацию из базы DESIGNER /DumpConfigToFiles в out_dir.
+
+    extensions=None — только основная конфигурация;
+    extensions="all" — основная и все расширения одной командой
+        -AllExtensions (платформа сама кладёт каждое расширение в
+        подпапку <out_dir>/<имя>/);
+    extensions=[...] — основная плюс каждое указанное расширение
+        отдельной командой -Extension в свою подпапку <out_dir>/<имя>/
+        (без флага -Extension подпапка обязательна: платформа пишет
+        выгрузку расширения её собственным Configuration.xml в корень
+        целевого каталога).
+
+    Подпапки расширений индексатор (dumpindex.extroots) распознаёт по
+    ConfigurationExtensionPurpose — код сразу виден в search_code как
+    ext.<имя>.*. Имена расширений валидируются заранее: они становятся
+    именами подкаталогов.
+
+    Возвращает {"base_error": str|None, "extensions": {имя: str|None}};
+    при ошибке выгрузки основной конфигурации бросает InstallError —
+    без неё искать нечего.
+    """
+    names = [_safe_extension_name(n) for n in (extensions or [])] \
+        if not isinstance(extensions, str) else []
+    if isinstance(extensions, str) and extensions != "all":
+        raise InstallError(f"--dump-extensions: ожидалось 'all' або список, отримано {extensions!r}")
+
+    if not platform_exe:
+        platform_exe = find_platform()
+    print(f"Platform: {platform_exe}")
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    def run(*extra: str) -> str | None:
+        return _run_designer(
+            platform_exe, db_path, server_mode, db_user, db_password, *extra
+        )
+
+    result: dict = {"base_error": None, "extensions": {}}
+
+    if extensions == "all":
+        print(f"Експорт конфігурації та всіх розширень: {out_dir}")
+        result["base_error"] = run("/DumpConfigToFiles", out_dir, "-AllExtensions")
+        if result["base_error"]:
+            raise InstallError(
+                f"DumpConfigToFiles -AllExtensions: {result['base_error']}")
+        return result
+
+    print(f"Експорт конфігурації: {out_dir}")
+    result["base_error"] = run("/DumpConfigToFiles", out_dir)
+    if result["base_error"]:
+        raise InstallError(f"DumpConfigToFiles: {result['base_error']}")
+
+    for name in names:
+        ext_dir = os.path.join(out_dir, name)
+        print(f"Експорт розширення: {name} -> {ext_dir}")
+        result["extensions"][name] = run(
+            "/DumpConfigToFiles", ext_dir, "-Extension", name)
+    return result
+
+
 def _install_from(
     ext_dir: str,
     platform_exe: str,
