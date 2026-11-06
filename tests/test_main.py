@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,60 +39,90 @@ main()
         assert 'Extension installed successfully.' in result.stdout
 
 
-# ── _run_dump: диспетчер --install --dump ──
-
-from types import SimpleNamespace  # noqa: E402
-
-from mcp_baf.__main__ import _run_dump  # noqa: E402
+# ── --install --dump: разбор --dump-extensions и связка с main() ──
 
 
-def _dump_args(**over):
-    base = dict(install="srv\\b", dump="/out", dump_extensions=None, server=True,
-                platform="1cv8.exe", db_user="u", db_password="p",
-                platform_version="")
-    base.update(over)
-    return SimpleNamespace(**base)
-
-
-def test_run_dump_parses_list(monkeypatch):
-    seen = {}
-
-    def fake_dump(**kw):
-        seen.update(kw)
-        return {"base_error": None, "extensions": {"A": None, "B": None}}
-
+def _run_main(monkeypatch, tmp_path, *argv):
+    """main() с подменёнными install/dump; возвращает (calls, exit_code)."""
     from mcp_baf import installer
-    monkeypatch.setattr(installer, "dump", fake_dump)
-    _run_dump(_dump_args(dump_extensions="A, B"))
-    assert seen["extensions"] == ["A", "B"]
-    assert seen["server_mode"] is True
+    from mcp_baf.__main__ import main
+
+    calls = []
+    monkeypatch.setattr(installer, "install", lambda **kw: calls.append(("install", kw)))
+    monkeypatch.setattr(installer, "dump", lambda **kw: calls.append(("dump", kw))
+                        or {"base_error": None, "extensions": {}})
+    monkeypatch.setattr(sys, "argv", ["mcp-baf", "--cache-dir", str(tmp_path), *argv])
+    try:
+        main()
+    except SystemExit as exc:
+        return calls, exc.code
+    return calls, 0
 
 
-def test_run_dump_all_keyword_passthrough(monkeypatch):
-    seen = {}
+def test_install_dump_list_parsed_and_passed(monkeypatch, tmp_path):
+    calls, code = _run_main(monkeypatch, tmp_path, "--install", "db", "--dump", "/out",
+                            "--dump-extensions", "A, B,a")
+    assert code == 0
+    assert [c[0] for c in calls] == ["install", "dump"]
+    assert calls[1][1]["extensions"] == ["A", "B", "a"]  # дубли снимает installer.dump
+
+
+@pytest.mark.parametrize("value", [[], ["ALL"], ["all"]])
+def test_install_dump_all_forms(monkeypatch, tmp_path, value):
+    calls, code = _run_main(monkeypatch, tmp_path, "--install", "db", "--dump", "/out",
+                            "--dump-extensions", *value)
+    assert code == 0
+    assert calls[1][1]["extensions"] == "all"
+
+
+def test_install_without_dump_flag_does_not_export(monkeypatch, tmp_path):
+    calls, code = _run_main(monkeypatch, tmp_path, "--install", "db")
+    assert code == 0
+    assert [c[0] for c in calls] == ["install"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["--install", "db", "--dump-extensions"],   # без --dump
+    ["--dump", "/out", "--dump-extensions"],    # без --install
+])
+def test_dump_extensions_requires_install_and_dump(monkeypatch, tmp_path, argv):
+    calls, code = _run_main(monkeypatch, tmp_path, *argv)
+    assert code == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", [",", " , ", "../x", "Catalogs", "A:B", "."])
+def test_bad_extension_names_rejected_before_install(monkeypatch, tmp_path, value):
+    calls, code = _run_main(monkeypatch, tmp_path, "--install", "db", "--dump", "/out",
+                            f"--dump-extensions={value}")
+    assert code == 1
+    assert calls == []
+
+
+def test_failed_extension_exits_1(monkeypatch, tmp_path):
     from mcp_baf import installer
-    monkeypatch.setattr(installer, "dump",
-                        lambda **kw: seen.update(kw) or {"base_error": None, "extensions": {}})
-    _run_dump(_dump_args(dump_extensions="all"))
-    assert seen["extensions"] == "all"
+    from mcp_baf.__main__ import _run_dump
 
-
-def test_run_dump_failed_extension_exits_1(monkeypatch):
-    from mcp_baf import installer
     monkeypatch.setattr(installer, "dump",
                         lambda **kw: {"base_error": None, "extensions": {"A": "boom"}})
+    args = SimpleNamespace(install="db", dump="/out", server=False, platform="",
+                           db_user="", db_password="", platform_version="")
     with pytest.raises(SystemExit) as exc:
-        _run_dump(_dump_args(dump_extensions="A"))
+        _run_dump(args, ["A"])
     assert exc.value.code == 1
 
 
-def test_run_dump_install_error_exits_1(monkeypatch):
+def test_base_dump_error_exits_1(monkeypatch, tmp_path):
     from mcp_baf import installer
 
     def boom(**kw):
         raise installer.InstallError("nope")
 
+    monkeypatch.setattr(installer, "install", lambda **kw: None)
     monkeypatch.setattr(installer, "dump", boom)
+    monkeypatch.setattr(sys, "argv", ["mcp-baf", "--cache-dir", str(tmp_path),
+                                      "--install", "db", "--dump", "/out"])
+    from mcp_baf.__main__ import main
     with pytest.raises(SystemExit) as exc:
-        _run_dump(_dump_args())
+        main()
     assert exc.value.code == 1
