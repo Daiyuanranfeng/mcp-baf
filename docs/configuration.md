@@ -77,7 +77,7 @@
 | `--http-port` | `mcp_baf_HTTP_PORT` | `8001` | Порт прив'язки для `https`/`http` |
 | `--http-allowed-hosts` | `mcp_baf_HTTP_ALLOWED_HOSTS` | — (захист вимкнено) | Дозволені `Host` через кому; вмикає захист від DNS-rebinding і додає хости в SAN згенерованого сертифіката |
 | `--http-token` | `mcp_baf_HTTP_TOKEN` (`_FILE`) | — (**обов'язковий** для `https`/`http`) | Bearer-токен: кожен запит несе `Authorization: Bearer <токен>`, інакше `401`. Задавайте через env — CLI видно в `ps` |
-| `--tls-cert` / `--tls-key` | `mcp_baf_TLS_CERT` / `mcp_baf_TLS_KEY` | — (згенерований CA) | Свій PEM-сертифікат і ключ для `https`, обидва або жоден. Якщо жоден — сервер один раз генерує CA і серверний сертифікат у `<cache-dir>/tls/` (`ca.crt` — клієнтам; SAN: `localhost`, `127.0.0.1`, ім'я хоста, `--http-host`, `--http-allowed-hosts`). Змінили хости — видаліть `tls/` |
+| `--tls-cert` / `--tls-key` | `mcp_baf_TLS_CERT` / `mcp_baf_TLS_KEY` | — (згенерований CA) | Свій PEM-сертифікат і ключ для `https`, обидва або жоден. Якщо жоден — сервер генерує CA і серверний сертифікат у `<cache-dir>/tls/` (`ca.crt` — клієнтам; SAN: `localhost`, `127.0.0.1`, ім'я хоста, `--http-host`, `--http-allowed-hosts`). Лист перевипускається за 30 днів до `notAfter` тим самим CA (`ca.key`, 0600) — `ca.crt` при цьому не змінюється; якщо CA сам прострочений або `ca.key` немає, будується новий комплект і клієнтам треба оновити `ca.crt`. Змінили хости — видаліть `tls/` |
 
 **Docker.** У корені репо — `Dockerfile` і `docker-compose.yaml`:
 `cp .env.example .env`, заповнити, `docker compose up -d --build`. Порт

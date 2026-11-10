@@ -16,7 +16,9 @@ dependencies = [
     # сквозной trace_id). В монорепо ставится из ../mcp-baf-audit
     # (pip install -e ../mcp-baf-audit); пин по тегу: mcp-baf-audit==0.2.1
     # (pip install "git+<repo>/mcp-baf-audit.git@v0.2.1").
-    "mcp-baf-audit>=0.2.1",
+    # `~=` ограничивает сверху: SCHEMA_VERSION='2' — часть контракта audit.log,
+    # minor bump 0.3 может сменить формат. Гард — tests/test_dependency_bounds.py.
+    "mcp-baf-audit~=0.2.1",
 ]
 
 [project.optional-dependencies]
