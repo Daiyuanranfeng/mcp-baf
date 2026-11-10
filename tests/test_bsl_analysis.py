@@ -1,6 +1,7 @@
 """Синтаксис, безопасное форматирование и приватность Python-анализатора."""
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,28 @@ def test_tools_filters_limits_privacy_and_no_source_file_changes(tmp_path):
     asyncio.run(scenario())
     assert 'PRIVATE_CODE' not in (tmp_path / 'audit.log').read_text()
     assert original.read_text() == src and original.stat().st_mtime_ns == timestamp
+
+
+def test_audit_has_char_count_not_code_and_stays_small(tmp_path):
+    # Аудит несёт только длину в символах: src не кодируется в байтовый буфер
+    # ради подсчёта и сам код в журнал не попадает.
+    src = 'Процедура PRIVATE_CODE()\nПерем А, Б;\nВозврат;\nКонецПроцедуры'
+    server = MCPServer('test')
+    bsl_analysis.register(server, AuditLog(str(tmp_path)))
+
+    async def scenario():
+        await server.call_tool('bsl_analyze', dict(src=src))
+        await server.call_tool('bsl_format', dict(src=src))
+
+    asyncio.run(scenario())
+    events = [json.loads(line) for line in (tmp_path / 'audit.log').read_text('utf-8').splitlines()]
+    calls = [e for e in events if e['event'] == 'tool.call']
+    assert {e['tool'] for e in calls} == {'bsl_analyze', 'bsl_format'}
+    for event in calls:
+        assert event['args']['src_chars'] == len(src)
+        assert 'src' not in event['args'] and 'src_bytes' not in event['args']
+        assert 'PRIVATE_CODE' not in json.dumps(event, ensure_ascii=False)
+        assert len(json.dumps(event, ensure_ascii=False)) < 1024
 
 
 @pytest.mark.parametrize('src', [

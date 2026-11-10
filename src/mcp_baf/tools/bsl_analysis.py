@@ -26,7 +26,9 @@ def register(mcp, audit):
             if len(hits) > limit:
                 lines.append(f"\n> Показаны первые {limit} диагностик.")
             return "\n".join(lines)
-        return await traced_text(audit, "bsl_analyze", run, args={"src_bytes": len(src.encode('utf-8')), "levels": levels, "diagnostic_codes": diagnostic_codes, "limit": limit})
+        # Размер в символах, без кодирования src в байтовый буфер: лимит 2 MiB
+        # проверяет bsl_native, а сам код в аудит не пишется.
+        return await traced_text(audit, "bsl_analyze", run, args={"src_chars": len(src), "levels": levels, "diagnostic_codes": diagnostic_codes, "limit": limit})
 
     @mcp.tool(description="Базовое форматирование BSL встроенным Python-форматером: отступы по 4 пробела и концевые пробелы. Сохраняет токены, строки, комментарии и LF/CRLF; при ошибках поддерживаемого синтаксиса отказывает. Возвращает код; исходные файлы и база не изменяются. src — текст, не путь.", annotations=ToolAnnotations(read_only_hint=True))
     async def bsl_format(src: str) -> str:
@@ -34,4 +36,4 @@ def register(mcp, audit):
             formatted = await asyncio.to_thread(format_source, src)
             fence = "`" * max(3, max((len(x) for x in re.findall(r'`+', formatted)), default=0) + 1)
             return f"{fence}bsl\n{formatted}\n{fence}"
-        return await traced_text(audit, "bsl_format", run, args={"src_bytes": len(src.encode('utf-8'))})
+        return await traced_text(audit, "bsl_format", run, args={"src_chars": len(src)})

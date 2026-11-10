@@ -7,7 +7,7 @@ import httpx
 import pytest
 from mcp.types import ToolAnnotations
 from mcp.client import Client
-from mcp.server.mcpserver import Context
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from mcp_baf_audit import AuditLog, set_trace_id
@@ -121,6 +121,53 @@ def test_real_mcp_protocol_filters_list_and_denies_hidden_call(tmp_path, mode):
         await client.aclose()
     asyncio.run(scenario())
     assert requests.count('/refs') == 1
+
+
+def test_tool_schemas_stripped_via_public_list_tools_without_touching_sdk(tmp_path):
+    # Публичный путь: list_tools() — метод MCPServer (источник payload tools/list),
+    # input_schema — публичное поле mcp.types.Tool. Приватный _tool_manager
+    # не используется; тест падает, если SDK сменит major или эту поверхность.
+    import importlib.metadata
+    from typing import Annotated, Literal
+    from mcp.types import Tool as MCPTool
+    from pydantic import Field
+
+    assert importlib.metadata.version('mcp').split('.')[0] == '2'
+    assert 'input_schema' in MCPTool.model_fields
+    assert asyncio.run(MCPServer.list_tools(MCPServer('bare'))) == []
+
+    client = OneCClient(Config(base_url='http://test'), httpx.MockTransport(lambda r: httpx.Response(200, json={'methods': []})))
+    server = AccessMCP('test', access_client=client, audit=AuditLog(str(tmp_path)))
+
+    @server.tool()
+    async def nested_tool(items: list[Literal['a', 'b']] | None = None,
+                          limit: Annotated[int, Field(ge=1)] = 5) -> str:
+        return 'ok'
+
+    def titles(node):
+        found = []
+        if isinstance(node, dict):
+            if 'title' in node:
+                found.append(node['title'])
+            for value in node.values():
+                found.extend(titles(value))
+        elif isinstance(node, list):
+            for value in node:
+                found.extend(titles(value))
+        return found
+
+    async def scenario():
+        listed = await server.list_tools()
+        assert titles(listed[0].input_schema) == []
+        assert listed[0].input_schema['properties']['limit']['minimum'] == 1
+        # Внутренняя схема SDK не мутирована: чистка идёт по копии.
+        assert 'title' in server._tool_manager.get_tool('nested_tool').parameters
+        async with Client(server) as session:
+            wire = (await session.list_tools()).tools[0].model_dump(by_alias=True, exclude_none=True)
+        assert titles(wire['inputSchema']) == []
+        await client.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_expected_errors_reach_client_but_bugs_stay_hidden(tmp_path):

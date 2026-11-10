@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -32,6 +33,36 @@ TOOL_METHODS = {
 # и канал выгрузки кода расширений выпадает из общего учёта доступа.
 EXTENSION_METHODS = frozenset({"extensions.GET"})
 
+
+
+def strip_schema_titles(schema: dict) -> None:
+    """Убирает автогенерированные pydantic'ом "title" из JSON-схемы.
+
+    Смысла для модели они не несут ("object_name" -> "Object Name"), но
+    раздувают init-payload. Чистятся только узлы схемы; ключи словаря
+    properties (имена параметров) не трогаются.
+    """
+    schema.pop("title", None)
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for sub in props.values():
+            if isinstance(sub, dict):
+                strip_schema_titles(sub)
+    for key in ("items", "additionalProperties"):
+        sub = schema.get(key)
+        if isinstance(sub, dict):
+            strip_schema_titles(sub)
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        subs = schema.get(key)
+        if isinstance(subs, list):
+            for sub in subs:
+                if isinstance(sub, dict):
+                    strip_schema_titles(sub)
+    defs = schema.get("$defs")
+    if isinstance(defs, dict):
+        for sub in defs.values():
+            if isinstance(sub, dict):
+                strip_schema_titles(sub)
 
 
 class AccessMCP(MCPServer):
@@ -88,7 +119,17 @@ class AccessMCP(MCPServer):
     async def list_tools(self):
         tools = await super().list_tools()
         allowed, _ = await self._capabilities()
-        return [t for t in tools if t.name not in TOOL_METHODS or TOOL_METHODS[t.name] in allowed]
+        visible = [t for t in tools if t.name not in TOOL_METHODS or TOOL_METHODS[t.name] in allowed]
+        # Схемы чистим здесь, а не через приватный _tool_manager: list_tools —
+        # публичный метод SDK и единственный источник payload tools/list.
+        # Снимаем deepcopy, потому что вложенные dict'ы MCPTool делят объекты
+        # с внутренней схемой SDK; мутировать её нельзя. Валидация вызовов
+        # идёт по fn_metadata и этой схемы не касается.
+        for tool in visible:
+            schema = copy.deepcopy(tool.input_schema)
+            strip_schema_titles(schema)
+            tool.input_schema = schema
+        return visible
 
     async def call_tool(self, name: str, arguments: dict, context: Context | None = None):
         if name in TOOL_METHODS:
