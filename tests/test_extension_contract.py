@@ -5,7 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from mcp_baf import __version__
-from mcp_baf.access import TOOL_METHODS
+from mcp_baf.access import EXTENSION_METHODS, TOOL_METHODS
 from mcp_baf.bsl_native.lexer import lex
 from mcp_baf.bsl_native.parser import Parser
 from mcp_baf.server import EXPECTED_EXTENSION_VERSION
@@ -101,14 +101,15 @@ def test_all_routes_ids_rights_handlers_and_guards():
             expected_grants.add(fullname+'.Method.'+methodname)
             body = re.search(r'Функция '+handler+r'\(Запрос\)(.*?)КонецФункции',module,re.S)
             assert body, handler
-            if name != 'Версия':
-                assert f'МетодДоступен("{name}", "{methodname}"' in body.group(1), handler
+            # /version тоже подчиняется праву использования метода, как и все маршруты.
+            assert f'МетодДоступен("{name}", "{methodname}"' in body.group(1), handler
             found.add(route.split('/')[1]+'.'+verb)
     assert set(TOOL_METHODS.values()) <= found
-    # /capabilities обязан объявлять ровно те методы, которых ждёт Python.
+    # /capabilities обязан объявлять ровно те методы, которых ждёт Python:
+    # методы инструментов и маршруты без инструмента (выгрузка .cfe).
     capabilities = re.search(r'Функция ВозможностиGET\(Запрос\)(.*?)КонецФункции', module, re.S).group(1)
     declared = dict(re.findall(r'Карта\.Вставить\("(\w+)", "([\w.-]+)"\)', capabilities))
-    assert set(declared.values()) == set(TOOL_METHODS.values())
+    assert set(declared.values()) == set(TOOL_METHODS.values()) | EXTENSION_METHODS
     assert set(declared) <= set(names)
     # Право Use принадлежит точке вызова HTTPService.URLTemplate.Method.
     # Роль не выдаёт прав контейнерам метаданных или бизнес-объектам.

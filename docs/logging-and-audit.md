@@ -63,6 +63,7 @@ service="mcp-baf")` — один інстанс на процес.
 | `tool.call` | `tools/common.py:traced_text` (`tool_call`) | **кожен** успішний виклик будь-якого інструмента: `tool`, `args`, `ok=true`, `duration_ms` |
 | `tool.error` | `tools/common.py:traced_text` (`tool_error`) | виняток у тілі інструмента: `tool`, `args`, `error`, `duration_ms`, `level="error"` |
 | `one_c.http` | `client.py:OneCClient._audit_http` | **рівно одна подія на кожен HTTP-виклик 1С** (успіх чи ні): `status`, `duration_ms`, `payload.response_bytes` — тіло запиту й відповіді ніколи не пишеться |
+| `access.capabilities_unavailable` | `access.py:AccessMCP._capabilities` | `/capabilities` не відповів або повернув непридатне тіло, тому HTTP-інструменти закрито: `reason` (клас винятку), `error` (текст клієнта, ≤300 символів), `level="error"`. Тіло `/capabilities` потрапляє лише як текст помилки 1С; дані бази не пишуться, секрети редагує пакет аудиту |
 
 ### `trace_id`: як `tool.call` пов'язується з `one_c.http`
 
