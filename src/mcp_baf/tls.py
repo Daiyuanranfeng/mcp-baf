@@ -8,14 +8,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import ipaddress
 import os
 import socket
+import tempfile
+
+from mcp_baf.filelock import file_lock
 
 CA_CERT_NAME = "ca.crt"
 SERVER_CERT_NAME = "server.crt"
 SERVER_KEY_NAME = "server.key"
+LOCK_NAME = ".lock"
 
 
 def self_signed_hosts(*extra: str) -> list[str]:
@@ -37,18 +42,104 @@ def _san(host: str):
         return x509.DNSName(host)
 
 
+def _bundle_valid(ca_path: str, cert_path: str, key_path: str) -> bool:
+    """Комплект готов и согласован: ca подписывает server.crt, key — его пара.
+
+    Проверка нужна, потому что каталог может остаться от прерванной
+    генерации (например, после kill -9 между записями файлов).
+    """
+    for path in (ca_path, cert_path, key_path):
+        try:
+            if os.path.getsize(path) == 0:
+                return False
+        except OSError:
+            return False
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+
+        with open(ca_path, "rb") as fh:
+            ca = x509.load_pem_x509_certificate(fh.read())
+        with open(cert_path, "rb") as fh:
+            cert = x509.load_pem_x509_certificate(fh.read())
+        with open(key_path, "rb") as fh:
+            key = serialization.load_pem_private_key(fh.read(), password=None)
+    except Exception:  # noqa: BLE001 — битый/недописанный файл = перегенерация
+        return False
+
+    if cert.issuer != ca.subject:
+        return False
+    algorithm = cert.signature_hash_algorithm
+    if algorithm is None:
+        return False
+    try:
+        # Для EC-подписи cryptography ждёт объект ECDSA, для RSA — padding+hash:
+        # signature_algorithm_parameters отдаёт именно то, что нужно ключу CA.
+        ca.public_key().verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            cert.signature_algorithm_parameters,
+        )
+    except Exception:  # noqa: BLE001 — подпись не сходится
+        return False
+    # Ключ и лист должны быть одной парой, иначе TLS-handshake упадёт.
+    try:
+        key_pub = key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        cert_pub = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return key_pub == cert_pub
+
+
+def _write_atomic(path: str, data: bytes, mode: int = 0o644) -> None:
+    """Записать файл через временный + os.replace: читатель видит либо старое,
+    либо целое новое содержимое, но не половину."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-tls-")
+    try:
+        if hasattr(os, "fchmod"):  # POSIX; на Windows прав доступу немає
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
 def ensure_self_signed(directory: str, hosts: list[str]) -> tuple[str, str, str]:
     """(ca.crt, server.crt, server.key) у directory; генерує, якщо їх нема.
 
-    shortcut: наявні файли не перевипускаються при зміні hosts чи наближенні
-    кінця строку — видаліть каталог, щоб перегенерувати.
+    Генерація йде під файловим локом `<directory>/.lock`: два процеси, що
+    стартують одночасно, не перезапишуть один одному ca.crt/server.crt (інакше
+    клієнт отримав би лист, підписаний чужим CA, і не пройшов верифікацію).
+    Валідний комплект не перевипускається — shortcut збережено: при зміні
+    hosts чи наближенні кінця строку видаліть каталог.
     """
     ca_path = os.path.join(directory, CA_CERT_NAME)
     cert_path = os.path.join(directory, SERVER_CERT_NAME)
     key_path = os.path.join(directory, SERVER_KEY_NAME)
-    if all(os.path.exists(p) for p in (ca_path, cert_path, key_path)):
-        return ca_path, cert_path, key_path
 
+    os.makedirs(directory, exist_ok=True)
+    with file_lock(os.path.join(directory, LOCK_NAME)):
+        # Повторная проверка уже под локом: второй процесс мог всё сделать,
+        # пока мы ждали.
+        if _bundle_valid(ca_path, cert_path, key_path):
+            return ca_path, cert_path, key_path
+        _generate(directory, hosts, ca_path, cert_path, key_path)
+    return ca_path, cert_path, key_path
+
+
+def _generate(directory: str, hosts: list[str], ca_path: str, cert_path: str, key_path: str) -> None:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -100,18 +191,13 @@ def ensure_self_signed(directory: str, hosts: list[str]) -> tuple[str, str, str]
         .sign(ca_key, hashes.SHA256())
     )
 
-    os.makedirs(directory, exist_ok=True)
     # Ключ CA не зберігаємо: новий лист = новий CA (видалити каталог).
-    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ))
-    with open(cert_path, "wb") as fh:
-        fh.write(cert.public_bytes(serialization.Encoding.PEM))
-    # ca.crt пишемо останнім: його наявність = комплект готовий.
-    with open(ca_path, "wb") as fh:
-        fh.write(ca_cert.public_bytes(serialization.Encoding.PEM))
-    return ca_path, cert_path, key_path
+    # Пишемо через os.replace: частковий файл ніколи не стає видимим.
+    _write_atomic(key_path, key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ), mode=0o600)
+    _write_atomic(cert_path, cert.public_bytes(serialization.Encoding.PEM))
+    # ca.crt пишемо останнім: він замикає комплект (порядок збережено).
+    _write_atomic(ca_path, ca_cert.public_bytes(serialization.Encoding.PEM))

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from mcp_baf.dumpindex.modulenames import (
     resolve_module_name,
 )
 from mcp_baf.dumpindex.synonyms import build_synonym_map
+from mcp_baf.filelock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,22 @@ CONTEXT_WINDOW = 2
 # Токены для FTS5-запроса: буквы и цифры без подчёркивания — так же
 # сегментирует идентификаторы токенизатор unicode61 самого FTS5.
 _TOKEN_RE = re.compile(r"[^\W_]+")
+
+# ── Ограничения пользовательского regex (ReDoS) ──
+# Регулярка приходит из запроса клиента и исполняется на произвольном коде
+# модулей: без ограничений `(a+)+$` на длинной строке вешает поток на минуты.
+MAX_REGEX_LENGTH = 400          # символов в шаблоне
+REGEX_TIME_BUDGET = 5.0         # секунд на весь regex-поиск
+MAX_REGEX_LINE = 20_000         # символов строки, отдаваемых regex (хвост режется)
+
+# Вложенный квантор: группа, внутри которой есть +/*, а снаружи — ещё один
+# квантор (catastrophic backtracking).
+_NESTED_QUANTIFIER_RE = re.compile(
+    r"\((?:[^()\\]|\\.|\([^()]*\))*[+*][^()]*\)\s*(?:[+*]|\{\d+,\})"
+)
+
+# Лок-файл рядом с index.db: межпроцессная сериализация open/build.
+INDEX_LOCK_TIMEOUT = 180.0
 
 
 @dataclass
@@ -128,21 +146,29 @@ class DumpIndex:
             # ключей (и на холодную сборку, и на diff кэша).
             self._ext_roots = discover_extension_roots(self._dir)
 
-            if self._db_path and self._reindex and os.path.exists(self._db_path):
-                os.remove(self._db_path)
+            if not self._db_path:
+                self._full_build()
+                self._finish_build(from_cache=False)
+                return
 
-            if self._db_path and not self._reindex and os.path.exists(self._db_path):
-                try:
-                    self._open_cache_and_diff()
-                    self._finish_build(from_cache=True)
-                    return
-                except Exception as exc:  # noqa: BLE001 — кэш битый, перестраиваем
-                    logger.warning("Cache load failed, rebuilding: %s", exc)
-                    self._close_db()
-                    os.remove(self._db_path)
+            os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
+            # Лок на весь цикл open/build: два процесса (сервер + дашборд)
+            # не открывают и не перестраивают один index.db одновременно.
+            # Без него один процесс мог удалить базу, пока другой её читал.
+            with file_lock(self._db_path + ".lock", timeout=INDEX_LOCK_TIMEOUT):
+                # Повторная проверка под локом: пока ждали, кэш мог быть
+                # уже собран/обновлён другим процессом.
+                if not self._reindex and os.path.exists(self._db_path):
+                    try:
+                        self._open_cache_and_diff()
+                        self._finish_build(from_cache=True)
+                        return
+                    except Exception as exc:  # noqa: BLE001 — кэш битый, перестраиваем
+                        logger.warning("Cache load failed, rebuilding: %s", exc)
+                        self._close_db()
 
-            self._full_build()
-            self._finish_build(from_cache=False)
+                self._full_build()
+                self._finish_build(from_cache=False)
         except Exception as exc:  # noqa: BLE001 — ошибка отдаётся из search()
             self._build_error = exc
 
@@ -162,12 +188,6 @@ class DumpIndex:
         if self._db is not None:
             self._db.close()
             self._db = None
-
-    def _connect(self) -> sqlite3.Connection:
-        if self._db_path:
-            os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
-            return sqlite3.connect(self._db_path, check_same_thread=False)
-        return sqlite3.connect(":memory:", check_same_thread=False)
 
     def _create_schema(self, db: sqlite3.Connection) -> None:
         db.execute(
@@ -252,18 +272,80 @@ class DumpIndex:
                 state.mtime_ms, state.size, contents[rel],
             ))
 
-        db = self._connect()
-        self._create_schema(db)
-        with db:
-            db.executemany(
-                "INSERT INTO docs(rel_path, name, category, module, "
-                "mtime_ms, size, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
-            db.execute(
-                "INSERT INTO fts(rowid, content) SELECT id, content FROM docs"
-            )
-        self._db = db
+        if not self._db_path:
+            db = sqlite3.connect(":memory:", check_same_thread=False)
+            self._create_schema(db)
+            with db:
+                db.executemany(
+                    "INSERT INTO docs(rel_path, name, category, module, "
+                    "mtime_ms, size, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                db.execute(
+                    "INSERT INTO fts(rowid, content) SELECT id, content FROM docs"
+                )
+            self._db = db
+            return
+
+        # Собираем во временный файл и подменяем им index.db атомарно:
+        # читатель всегда видит либо старую целую базу, либо новую целую,
+        # но не полузаписанную и не отсутствующую.
+        tmp_path = f"{self._db_path}.build-{os.getpid()}-{threading.get_ident()}"
+        try:
+            db = sqlite3.connect(tmp_path, check_same_thread=False)
+            try:
+                self._create_schema(db)
+                with db:
+                    db.executemany(
+                        "INSERT INTO docs(rel_path, name, category, module, "
+                        "mtime_ms, size, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    )
+                    db.execute(
+                        "INSERT INTO fts(rowid, content) SELECT id, content FROM docs"
+                    )
+            finally:
+                db.close()
+            self._replace_db(tmp_path)
+        except BaseException:
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path + suffix)
+            raise
+
+        self._db = sqlite3.connect(self._db_path, check_same_thread=False)
+
+    def _replace_db(self, tmp_path: str) -> None:
+        """Атомарно подменяет index.db собранным временным файлом.
+
+        На POSIX os.replace атомарен даже при открытом читателе. На Windows
+        открытый другим процессом файл заменить нельзя — тогда копируем
+        содержимое через SQLite backup API (транзакционно, читатели видят
+        старую версию до коммита). Если цель битая (backup не читается),
+        повторяем os.replace: к этому моменту держателей файла обычно нет.
+        """
+        try:
+            os.replace(tmp_path, self._db_path)
+            return
+        except PermissionError:  # Windows: файл держит другой процесс
+            pass
+
+        src = sqlite3.connect(tmp_path)
+        try:
+            dst = sqlite3.connect(self._db_path)
+            try:
+                src.backup(dst)
+            except sqlite3.Error:
+                dst.close()
+                os.replace(tmp_path, self._db_path)
+                return
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    dst.close()
+        finally:
+            src.close()
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
 
     def _ext_roots_key(self) -> str:
         return json.dumps(self._ext_roots, sort_keys=True, ensure_ascii=False)
@@ -412,12 +494,12 @@ class DumpIndex:
         if params.mode == "smart":
             return self._search_smart(params)
         if params.mode == "regex":
-            try:
-                pattern = re.compile(params.query)
-            except re.error as exc:
-                raise ValueError(f"invalid regex {params.query!r}: {exc}") from exc
+            pattern = _compile_user_regex(params.query)
             return self._search_line_by_line(
-                params, lambda line: pattern.search(line) is not None
+                params,
+                lambda line: pattern.search(line) is not None,
+                deadline=time.monotonic() + REGEX_TIME_BUDGET,
+                line_limit=MAX_REGEX_LINE,
             )
         if params.mode == "exact":
             needle = params.query.lower()
@@ -497,9 +579,18 @@ class DumpIndex:
         return matches, total
 
     def _search_line_by_line(
-        self, params: SearchParams, match: "callable[[str], bool]"
+        self,
+        params: SearchParams,
+        match: "callable[[str], bool]",
+        deadline: float | None = None,
+        line_limit: int | None = None,
     ) -> tuple[list[Match], int]:
-        """Построчный поиск (режимы regex и exact)."""
+        """Построчный поиск (режимы regex и exact).
+
+        Строки читаются потоково курсором, а не через fetchall(): весь код
+        модулей в RAM не поднимается. `deadline`/`line_limit` ограничивают
+        regex-поиск по времени и длине строки (защита от ReDoS).
+        """
         where = []
         args: list[str] = []
         if params.category:
@@ -513,27 +604,53 @@ class DumpIndex:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY name"
 
-        with self._db_lock:
-            assert self._db is not None
-            rows = self._db.execute(sql, args).fetchall()
-
         matches: list[Match] = []
         total = 0
-        for name, content in rows:
-            lines = content.split("\n")
-            for i, line in enumerate(lines):
-                if match(line):
-                    total += 1
-                    if len(matches) < params.limit:
-                        matches.append(
-                            Match(
-                                module=name,
-                                line=i + 1,
-                                context=_extract_context(lines, i),
+        with self._db_lock:
+            assert self._db is not None
+            cursor = self._db.execute(sql, args)
+            for name, content in cursor:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise ValueError(
+                        f"regex search exceeded {REGEX_TIME_BUDGET:.0f}s time budget"
+                    )
+                lines = content.split("\n")
+                for i, line in enumerate(lines):
+                    if line_limit is not None and len(line) > line_limit:
+                        line = line[:line_limit]
+                    if match(line):
+                        total += 1
+                        if len(matches) < params.limit:
+                            matches.append(
+                                Match(
+                                    module=name,
+                                    line=i + 1,
+                                    context=_extract_context(lines, i),
+                                )
                             )
-                        )
 
         return matches, total
+
+
+def _compile_user_regex(pattern: str) -> re.Pattern[str]:
+    """Компилирует пользовательский regex с ограничениями против ReDoS.
+
+    Отклоняет слишком длинные шаблоны и вложенные кванторы (`(a+)+`,
+    `(\\w*)*`), на которых backtracking растёт экспоненциально. Остаточный
+    риск закрывают дедлайн и ограничение длины строки в _search_line_by_line.
+    """
+    if len(pattern) > MAX_REGEX_LENGTH:
+        raise ValueError(
+            f"regex too long: {len(pattern)} chars (max {MAX_REGEX_LENGTH})"
+        )
+    if _NESTED_QUANTIFIER_RE.search(pattern):
+        raise ValueError(
+            "regex rejected: nested quantifier can cause catastrophic backtracking"
+        )
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"invalid regex {pattern!r}: {exc}") from exc
 
 
 def _extract_context(lines: list[str], idx: int, window: int = CONTEXT_WINDOW) -> str:

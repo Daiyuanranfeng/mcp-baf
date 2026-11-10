@@ -88,6 +88,61 @@ def test_regex_invalid(index):
         index.search(SearchParams(query="[unclosed", mode="regex"))
 
 
+def test_regex_too_long_rejected(index):
+    with pytest.raises(ValueError, match="too long"):
+        index.search(SearchParams(query="a" * 1000, mode="regex"))
+
+
+@pytest.mark.parametrize("pattern", [r"(a+)+$", r"(\w*)*", r"(\d+)*\s", r"(x+x+)+y"])
+def test_regex_nested_quantifier_rejected(index, pattern):
+    with pytest.raises(ValueError, match="nested quantifier"):
+        index.search(SearchParams(query=pattern, mode="regex"))
+
+
+def test_regex_time_budget_enforced(index, monkeypatch):
+    from mcp_baf.dumpindex import index as index_module
+
+    monkeypatch.setattr(index_module, "REGEX_TIME_BUDGET", -1.0)
+    with pytest.raises(ValueError, match="time budget"):
+        index.search(SearchParams(query="Процедура|Функция", mode="regex"))
+
+
+def test_line_search_streams_rows(index):
+    """Режимы regex/exact не тянут весь код модулей через fetchall()."""
+
+    class NoFetchallCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __iter__(self):
+            return iter(self._cursor)
+
+        def fetchone(self):
+            return self._cursor.fetchone()
+
+        def fetchall(self):
+            raise AssertionError("fetchall() must not be used for line-by-line search")
+
+    class NoFetchallConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *args, **kwargs):
+            return NoFetchallCursor(self._conn.execute(*args, **kwargs))
+
+        def close(self):
+            self._conn.close()
+
+    original = index._db
+    index._db = NoFetchallConn(original)
+    try:
+        matches, total = index.search(SearchParams(query="Процедура", mode="exact"))
+    finally:
+        index._db = original
+    assert total == 2
+    assert len(matches) == 2
+
+
 def test_category_filter(index):
     _, total = index.search(
         SearchParams(query="Процедура", mode="exact", category="Документ")
