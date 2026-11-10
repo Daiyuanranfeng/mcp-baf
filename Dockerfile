@@ -17,7 +17,19 @@ COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN pip install .
 
-RUN mkdir -p /data
+# Непривилегированный пользователь: сервер не работает от root.
+# /data — том с кэшем индекса, audit.log и TLS-ключом; владелец каталога
+# должен совпадать с пользователем процесса, иначе запись в том падает.
+# /data/tls создаём заранее: docker копирует владельца пустого named volume
+# из образа, иначе отдельный том mcp-baf-tls достался бы root.
+RUN groupadd --gid 10001 mcpbaf \
+    && useradd --uid 10001 --gid 10001 --home-dir /app --no-create-home \
+       --shell /usr/sbin/nologin mcpbaf \
+    && mkdir -p /data/tls \
+    && chown -R mcpbaf:mcpbaf /data
+
+USER mcpbaf
+
 VOLUME ["/data"]
 
 EXPOSE 8001

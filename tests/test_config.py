@@ -1,5 +1,7 @@
 """Тесты конфигурации: приоритет defaults -> env -> CLI."""
 
+import os
+
 from mcp_baf_audit import DEFAULT_AUDIT_ARCHIVES, DEFAULT_AUDIT_MAX_SIZE_MIB
 
 import pytest
@@ -118,3 +120,68 @@ def test_password_flags_help_warns_about_ps(capsys):
     # пароль сервиса и пароль базы: оба флага видны в ps — предупреждаем
     assert "--pass" in out and "visible in ps" in out
     assert "--db-password" in out and "mcp_baf_DB_PASSWORD_FILE" in out
+
+
+# ── Таймаути httpx по фазах і політика повторів ──
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """Изолирует тест от mcp_baf_* переменных окружения хоста."""
+    for name in list(os.environ):
+        if name.startswith("mcp_baf_"):
+            monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_timeout_defaults_are_split_by_phase(clean_env):
+    cfg = load_config(parse_args([]))
+    assert cfg.request_timeout == 300  # read
+    assert cfg.connect_timeout == 10   # connect короткий
+    assert cfg.write_timeout == 60
+    assert cfg.pool_timeout == 10
+
+
+def test_phase_timeouts_from_env(clean_env):
+    clean_env.setenv("mcp_baf_CONNECT_TIMEOUT", "3")
+    clean_env.setenv("mcp_baf_WRITE_TIMEOUT", "45")
+    clean_env.setenv("mcp_baf_POOL_TIMEOUT", "4")
+    cfg = load_config(parse_args([]))
+    assert (cfg.connect_timeout, cfg.write_timeout, cfg.pool_timeout) == (3, 45, 4)
+
+
+def test_phase_timeouts_cli_overrides_env(clean_env):
+    clean_env.setenv("mcp_baf_CONNECT_TIMEOUT", "3")
+    cfg = load_config(parse_args(["--connect-timeout", "12", "--write-timeout", "30",
+                                  "--pool-timeout", "8"]))
+    assert (cfg.connect_timeout, cfg.write_timeout, cfg.pool_timeout) == (12, 30, 8)
+
+
+def test_retry_defaults(clean_env):
+    cfg = load_config(parse_args([]))
+    assert cfg.retry_attempts == 2
+    assert cfg.retry_backoff == 0.5
+    assert cfg.retry_non_idempotent is False
+
+
+def test_retry_env_and_cli(clean_env):
+    clean_env.setenv("mcp_baf_RETRY_ATTEMPTS", "5")
+    clean_env.setenv("mcp_baf_RETRY_BACKOFF", "0.25")
+    clean_env.setenv("mcp_baf_RETRY_NON_IDEMPOTENT", "1")
+    cfg = load_config(parse_args([]))
+    assert (cfg.retry_attempts, cfg.retry_backoff, cfg.retry_non_idempotent) == (5, 0.25, True)
+
+    clean_env.delenv("mcp_baf_RETRY_ATTEMPTS")
+    cfg = load_config(parse_args(["--retry-attempts", "0", "--retry-backoff", "1.5"]))
+    assert cfg.retry_attempts == 0  # явный 0 выключает повторы
+    assert cfg.retry_backoff == 1.5
+    assert load_config(parse_args(["--retry-non-idempotent"])).retry_non_idempotent is True
+
+
+def test_invalid_retry_env_falls_back_to_default(clean_env):
+    clean_env.setenv("mcp_baf_RETRY_ATTEMPTS", "many")
+    clean_env.setenv("mcp_baf_RETRY_BACKOFF", "-1")
+    cfg = load_config(parse_args([]))
+    assert cfg.retry_attempts == 2
+    assert cfg.retry_backoff == 0.5
+

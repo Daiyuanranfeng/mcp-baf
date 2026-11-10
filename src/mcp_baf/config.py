@@ -31,6 +31,18 @@ DEFAULT_MAX_RESPONSE_SIZE_MIB = 128
 # для передачи крупных ответов /extensions (сотни мегабайт).
 DEFAULT_REQUEST_TIMEOUT = 300
 
+# Таймауты httpx по фазам. connect короткий: недоступный хост/порт должен
+# падать за секунды, а не висеть 300 с. read совпадает с request_timeout.
+DEFAULT_CONNECT_TIMEOUT = 10
+DEFAULT_WRITE_TIMEOUT = 60
+DEFAULT_POOL_TIMEOUT = 10
+
+# Повторы идемпотентных запросов на транзиентные ошибки (транспорт/5xx).
+# retry_attempts — число повторов ПОСЛЕ первой попытки; 0 отключает повторы.
+DEFAULT_RETRY_ATTEMPTS = 2
+# База экспоненциального backoff, секунды: 0.5, 1.0, 2.0 ...
+DEFAULT_RETRY_BACKOFF = 0.5
+
 
 @dataclass
 class Config:
@@ -38,7 +50,19 @@ class Config:
     user: str = ""
     password: str = ""
     max_response_size_mib: int = DEFAULT_MAX_RESPONSE_SIZE_MIB
+    # Таймаут чтения ответа 1С (фаза read у httpx), секунды.
     request_timeout: int = DEFAULT_REQUEST_TIMEOUT
+    # Остальные фазы httpx: установка соединения, отправка тела, ожидание
+    # свободного слота в пуле. connect намеренно короткий.
+    connect_timeout: int = DEFAULT_CONNECT_TIMEOUT
+    write_timeout: int = DEFAULT_WRITE_TIMEOUT
+    pool_timeout: int = DEFAULT_POOL_TIMEOUT
+    # Повторы идемпотентных запросов: число повторов после первой попытки
+    # (0 — выключено) и база экспоненциального backoff в секундах.
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    retry_backoff: float = DEFAULT_RETRY_BACKOFF
+    # Разрешить повторы и для неидемпотентных запросов (записи).
+    retry_non_idempotent: bool = False
     # Путь к выгрузке конфигурации (DumpConfigToFiles); включает search_code.
     dump_dir: str = ""
     help_dir: str = ""
@@ -59,8 +83,12 @@ class Config:
     allow_insecure_http: bool = False
     http_host: str = DEFAULT_HTTP_HOST
     http_port: int = DEFAULT_HTTP_PORT
-    # Разрешённые Host через запятую; пусто — защита от DNS-rebinding выключена.
+    # Разрешённые Host через запятую; пусто — набор по умолчанию
+    # (localhost, 127.0.0.1, [::1], bind-хост, hostname). Защита от
+    # DNS-rebinding включена всегда, пока её явно не выключат.
     http_allowed_hosts: str = ""
+    # Выключатель защиты от DNS-rebinding (только для отладки/сервер-сервер).
+    dns_rebinding_protection: bool = True
     # Bearer-токен, обязателен для https/http: без него чтение базы открыто сети.
     http_token: str = ""
     # Свои cert/key для https; пусто — самоподписанный CA в <cache_dir>/tls/.
@@ -87,6 +115,37 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return n if n > 0 else default
+
+
+def _env_int_nonneg(name: str, default: int) -> int:
+    """Как _env_int, но 0 — допустимое значение (выключатель повторов)."""
+    value = os.environ.get(name, "").strip()
+    try:
+        n = int(value)
+    except ValueError:
+        return default
+    return n if n >= 0 else default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Читает неотрицательное число из переменной окружения."""
+    value = os.environ.get(name, "").strip()
+    try:
+        n = float(value)
+    except ValueError:
+        return default
+    return n if n >= 0 else default
+
+
+_TRUE = ("1", "true", "yes", "on")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Читает булев флаг из переменной окружения (1/true/yes/on)."""
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in _TRUE
 
 
 def _env_secret(name: str) -> str:
@@ -201,8 +260,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--request-timeout", type=int, default=0, metavar="SECONDS",
-        help="Timeout for an HTTP request to 1C, in seconds. "
+        help="Read timeout for an HTTP response from 1C, in seconds. "
              f"Default: {DEFAULT_REQUEST_TIMEOUT}.",
+    )
+    parser.add_argument(
+        "--connect-timeout", type=int, default=0, metavar="SECONDS",
+        help="Connect timeout to 1C (env mcp_baf_CONNECT_TIMEOUT). "
+             f"Default: {DEFAULT_CONNECT_TIMEOUT}.",
+    )
+    parser.add_argument(
+        "--write-timeout", type=int, default=0, metavar="SECONDS",
+        help="Write timeout when sending a request to 1C (env mcp_baf_WRITE_TIMEOUT). "
+             f"Default: {DEFAULT_WRITE_TIMEOUT}.",
+    )
+    parser.add_argument(
+        "--pool-timeout", type=int, default=0, metavar="SECONDS",
+        help="Pool timeout waiting for a free connection (env mcp_baf_POOL_TIMEOUT). "
+             f"Default: {DEFAULT_POOL_TIMEOUT}.",
+    )
+    parser.add_argument(
+        "--retry-attempts", type=int, default=None, metavar="N",
+        help="Retries after the first attempt for idempotent requests on "
+             "transport errors/5xx (env mcp_baf_RETRY_ATTEMPTS; 0 disables). "
+             f"Default: {DEFAULT_RETRY_ATTEMPTS}.",
+    )
+    parser.add_argument(
+        "--retry-backoff", type=float, default=None, metavar="SECONDS",
+        help="Base of the exponential retry backoff (env mcp_baf_RETRY_BACKOFF). "
+             f"Default: {DEFAULT_RETRY_BACKOFF}.",
+    )
+    parser.add_argument(
+        "--retry-non-idempotent", action="store_true",
+        help="Also retry non-idempotent (write) requests "
+             "(env mcp_baf_RETRY_NON_IDEMPOTENT=1).",
     )
     parser.add_argument(
         "--audit-max-size", type=int, default=0, metavar="MIB",
@@ -239,7 +329,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--http-allowed-hosts", default="", metavar="HOSTS",
         help="Comma-separated allowed Host headers for --transport http(s). "
-             "Empty disables DNS-rebinding protection (internal network).",
+             "Empty uses the built-in set (localhost, 127.0.0.1, [::1], bind host, "
+             "hostname) and keeps DNS-rebinding protection on.",
+    )
+    parser.add_argument(
+        "--disable-dns-rebinding", action="store_true",
+        help="Turn off Host/Origin validation for --transport http(s) "
+             "(env mcp_baf_HTTP_DISABLE_DNS_REBINDING=1). Not recommended.",
     )
     parser.add_argument(
         "--http-token", default="", metavar="TOKEN",
@@ -277,6 +373,12 @@ def load_config(args: argparse.Namespace) -> Config:
             "mcp_baf_MAX_RESPONSE_SIZE", DEFAULT_MAX_RESPONSE_SIZE_MIB
         ),
         request_timeout=_env_int("mcp_baf_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT),
+        connect_timeout=_env_int("mcp_baf_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT),
+        write_timeout=_env_int("mcp_baf_WRITE_TIMEOUT", DEFAULT_WRITE_TIMEOUT),
+        pool_timeout=_env_int("mcp_baf_POOL_TIMEOUT", DEFAULT_POOL_TIMEOUT),
+        retry_attempts=_env_int_nonneg("mcp_baf_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS),
+        retry_backoff=_env_float("mcp_baf_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF),
+        retry_non_idempotent=_env_bool("mcp_baf_RETRY_NON_IDEMPOTENT"),
         dump_dir=os.environ.get("mcp_baf_DUMP_DIR", ""),
         help_dir=os.environ.get("mcp_baf_HELP_DIR", ""),
         audit_max_size_mib=_env_int(
@@ -284,13 +386,12 @@ def load_config(args: argparse.Namespace) -> Config:
         ),
         audit_archives=_env_int("mcp_baf_AUDIT_ARCHIVES", DEFAULT_AUDIT_ARCHIVES),
         transport=os.environ.get("mcp_baf_TRANSPORT", "") or "stdio",
-        allow_insecure_http=os.environ.get("mcp_baf_ALLOW_INSECURE_HTTP", "").strip().lower()
-        in ("1", "true", "yes", "on"),
-        mask_pii=os.environ.get("mcp_baf_MASK_PII", "").strip().lower()
-        in ("1", "true", "yes", "on"),
+        allow_insecure_http=_env_bool("mcp_baf_ALLOW_INSECURE_HTTP"),
+        mask_pii=_env_bool("mcp_baf_MASK_PII"),
         http_host=os.environ.get("mcp_baf_HTTP_HOST", "") or DEFAULT_HTTP_HOST,
         http_port=_env_int("mcp_baf_HTTP_PORT", DEFAULT_HTTP_PORT),
         http_allowed_hosts=os.environ.get("mcp_baf_HTTP_ALLOWED_HOSTS", ""),
+        dns_rebinding_protection=not _env_bool("mcp_baf_HTTP_DISABLE_DNS_REBINDING"),
         http_token=_env_secret("mcp_baf_HTTP_TOKEN"),
         tls_cert=os.environ.get("mcp_baf_TLS_CERT", ""),
         tls_key=os.environ.get("mcp_baf_TLS_KEY", ""),
@@ -312,6 +413,17 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.max_response_size_mib = args.max_response_size
     if args.request_timeout > 0:
         cfg.request_timeout = args.request_timeout
+    if args.connect_timeout > 0:
+        cfg.connect_timeout = args.connect_timeout
+    if args.write_timeout > 0:
+        cfg.write_timeout = args.write_timeout
+    if args.pool_timeout > 0:
+        cfg.pool_timeout = args.pool_timeout
+    if args.retry_attempts is not None:
+        cfg.retry_attempts = max(0, args.retry_attempts)
+    if args.retry_backoff is not None:
+        cfg.retry_backoff = max(0.0, args.retry_backoff)
+    cfg.retry_non_idempotent = args.retry_non_idempotent or cfg.retry_non_idempotent
     if args.audit_max_size > 0:
         cfg.audit_max_size_mib = args.audit_max_size
     if args.audit_archives > 0:
@@ -324,6 +436,8 @@ def load_config(args: argparse.Namespace) -> Config:
     if args.http_port > 0:
         cfg.http_port = args.http_port
     cfg.http_allowed_hosts = args.http_allowed_hosts or cfg.http_allowed_hosts
+    if args.disable_dns_rebinding:
+        cfg.dns_rebinding_protection = False
     cfg.http_token = args.http_token or cfg.http_token
     cfg.tls_cert = args.tls_cert or cfg.tls_cert
     cfg.tls_key = args.tls_key or cfg.tls_key

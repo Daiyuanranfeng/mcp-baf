@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -39,8 +40,18 @@ def scrub_error_detail(detail: str, limit: int = MAX_ERROR_DETAIL_CHARS) -> str:
     return text
 
 
+# Статусы, которые имеет смысл повторить: сервер не обработал запрос из-за
+# временной проблемы (перегрузка, прокси, рестарт 1С). Остальные 5xx
+# детерминированы и повтор их только удлинит ошибку.
+_RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
+
+
 class OneCError(Exception):
     """Ошибка взаимодействия с 1С с понятным пользователю текстом."""
+
+
+class _RetryableOneCError(OneCError):
+    """Транзиентная ошибка: идемпотентный запрос имеет смысл повторить."""
 
 
 class OneCClient:
@@ -49,7 +60,13 @@ class OneCClient:
     Если задан пользователь, ко всем запросам добавляется basic auth.
     Ответ крупнее лимита отбрасывается с понятной ошибкой вместо OOM.
     Каждый вызов 1С оставляет ровно одно событие аудита one_c.http
-    (метод, эндпоинт, статус, длительность, размер ответа); тело не логируется.
+    (метод, эндпоинт, статус, длительность, размер ответа, число попыток);
+    тело не логируется.
+
+    Таймауты httpx разделены по фазам: connect короткий (недоступный хост
+    падает за секунды), read — длинный (крупные ответы /extensions).
+    Идемпотентные запросы повторяются на транспортные ошибки и 5xx с
+    экспоненциальным backoff; неидемпотентные — только с явным флагом.
     """
 
     def __init__(
@@ -62,6 +79,9 @@ class OneCClient:
         self._base_url = config.base_url.rstrip("/")
         self._max_response_size = config.max_response_size_mib * _MIB
         self._audit = audit
+        self._retry_attempts = max(0, config.retry_attempts)
+        self._retry_backoff = max(0.0, config.retry_backoff)
+        self._retry_non_idempotent = config.retry_non_idempotent
 
         auth = None
         if config.user:
@@ -69,27 +89,54 @@ class OneCClient:
 
         self._http = httpx.AsyncClient(
             auth=auth,
-            timeout=httpx.Timeout(config.request_timeout),
+            # httpx.Timeout(первый аргумент) — таймаут read; остальные фазы
+            # задаются явно, иначе 300 с ушли бы и на connect.
+            timeout=httpx.Timeout(
+                config.request_timeout,
+                connect=config.connect_timeout,
+                write=config.write_timeout,
+                pool=config.pool_timeout,
+            ),
             # Закрываем соединение после каждого запроса,
             # чтобы не упираться в лимит сеансов 1С.
             headers={"Connection": "close"},
             transport=transport,
         )
 
-    async def get(self, endpoint: str) -> Any:
+    async def get(self, endpoint: str, *, idempotent: bool | None = None) -> Any:
         """GET-запрос к эндпоинту 1С с разбором JSON-ответа."""
-        return await self._do("GET", endpoint)
+        return await self._do("GET", endpoint, idempotent=idempotent)
 
-    async def post(self, endpoint: str, body: Any) -> Any:
-        """POST-запрос к эндпоинту 1С с JSON-телом и разбором JSON-ответа."""
-        return await self._do("POST", endpoint, body)
+    async def post(
+        self, endpoint: str, body: Any, *, idempotent: bool | None = None
+    ) -> Any:
+        """POST-запрос к эндпоинту 1С с JSON-телом и разбором JSON-ответа.
 
-    async def _do(self, method: str, endpoint: str, body: Any = None) -> Any:
+        HTTP-сервис mcp-baf только читает базу (query, eventlog, refs...),
+        поэтому POST здесь идемпотентен. Для будущих пишущих эндпоинтов
+        передайте idempotent=False: повторов не будет (если явно не включены
+        mcp_baf_RETRY_NON_IDEMPOTENT).
+        """
+        return await self._do("POST", endpoint, body, idempotent=idempotent)
+
+    async def _do(
+        self,
+        method: str,
+        endpoint: str,
+        body: Any = None,
+        *,
+        idempotent: bool | None = None,
+    ) -> Any:
         kwargs: dict[str, Any] = {}
         if body is not None:
             kwargs["json"] = body
         # request_id для аудита берём из тела (если есть), а не из лога тела.
         request_id = body.get("request_id") if isinstance(body, dict) else None
+
+        # HTTP-сервис 1С только читает базу: GET и POST-чтение идемпотентны.
+        if idempotent is None:
+            idempotent = True
+        retries = self._retry_attempts if (idempotent or self._retry_non_idempotent) else 0
 
         start = time.monotonic()
 
@@ -97,51 +144,90 @@ class OneCClient:
             return int((time.monotonic() - start) * 1000)
 
         # Состояние для ровно одного события one_c.http (пишется в finally).
-        status_code: int | None = None
-        response_bytes = 0
         # В аудит уходит только тип ошибки (и статус), но не её текст.
-        error_kind: str | None = None
+        state: dict[str, Any] = {"status": None, "bytes": 0, "error_kind": None}
+        attempts = 0
         try:
-            try:
-                async with self._http.stream(
-                    method, self._base_url + endpoint, **kwargs
-                ) as resp:
-                    status_code = resp.status_code
-                    if resp.status_code != 200:
-                        detail = scrub_error_detail(
-                            (await resp.aread())[:4096].decode("utf-8", "replace")
-                        )
-                        error_kind = f"http_{resp.status_code}"
-                        raise OneCError(
-                            f"1C returned status {resp.status_code}: {detail}"
-                        )
-
-                    # Читаем не более limit+1 байт: если поток обрезан потолком,
-                    # выдаём понятную ошибку вместо невнятной ошибки декодера.
-                    raw = bytearray()
-                    async for chunk in resp.aiter_bytes():
-                        raw.extend(chunk)
-                        if len(raw) > self._max_response_size:
-                            response_bytes = len(raw)
-                            error_kind = "response_too_large"
-                            raise OneCError(self._response_too_large_message())
-                    response_bytes = len(raw)
-            except httpx.HTTPError as exc:
-                error_kind = "transport_error"
-                raise OneCError(
-                    f"executing request to 1C: {scrub_error_detail(str(exc))}"
-                ) from exc
-
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                error_kind = "decode_error"
-                raise OneCError(f"decoding 1C response: {exc}") from exc
+            while True:
+                attempts += 1
+                try:
+                    result = await self._attempt(method, endpoint, kwargs, state)
+                    return result
+                except _RetryableOneCError:
+                    # state["error_kind"] уже выставлен попыткой; аудит покажет
+                    # итог последней попытки.
+                    if attempts > retries:
+                        raise
+                    # Экспоненциальный backoff: backoff, 2*backoff, 4*backoff...
+                    await asyncio.sleep(self._retry_backoff * (2 ** (attempts - 1)))
+                except OneCError:
+                    raise
         finally:
             self._audit_http(
-                method, endpoint, status_code, elapsed_ms(),
-                response_bytes, request_id, error_kind,
+                method, endpoint, state["status"], elapsed_ms(),
+                state["bytes"], request_id, state["error_kind"], attempts,
             )
+
+    async def _attempt(
+        self,
+        method: str,
+        endpoint: str,
+        kwargs: dict[str, Any],
+        state: dict[str, Any],
+    ) -> Any:
+        """Одна попытка запроса; обновляет state для аудита.
+
+        Транспортные ошибки и транзиентные 5xx поднимаются как
+        _RetryableOneCError; остальные — как OneCError.
+        """
+        raw = bytearray()
+        # Аудит показывает последнюю попытку: сбрасываем состояние каждой попытки.
+        state["status"] = None
+        state["bytes"] = 0
+        state["error_kind"] = None
+        try:
+            async with self._http.stream(
+                method, self._base_url + endpoint, **kwargs
+            ) as resp:
+                state["status"] = resp.status_code
+                if resp.status_code != 200:
+                    # Тело ошибки 1С не утекает к агенту: маскируем ПДн и режем.
+                    detail = scrub_error_detail(
+                        (await resp.aread())[:4096].decode("utf-8", "replace")
+                    )
+                    state["error_kind"] = f"http_{resp.status_code}"
+                    message = f"1C returned status {resp.status_code}: {detail}"
+                    if resp.status_code in _RETRYABLE_STATUSES:
+                        raise _RetryableOneCError(message)
+                    raise OneCError(message)
+
+                # Читаем не более limit+1 байт: если поток обрезан потолком,
+                # выдаём понятную ошибку вместо невнятной ошибки декодера.
+                async for chunk in resp.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > self._max_response_size:
+                        state["bytes"] = len(raw)
+                        state["error_kind"] = "response_too_large"
+                        raise OneCError(self._response_too_large_message())
+                state["bytes"] = len(raw)
+        except httpx.TransportError as exc:
+            # Сеть/таймаут/обрыв соединения — транзиентно, можно повторить.
+            state["error_kind"] = "transport_error"
+            raise _RetryableOneCError(
+                f"executing request to 1C: {scrub_error_detail(str(exc))}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            # Некорректный URL/протокол и т.п. — повтор не поможет.
+            state["error_kind"] = "transport_error"
+            raise OneCError(
+                f"executing request to 1C: {scrub_error_detail(str(exc))}"
+            ) from exc
+
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            state["error_kind"] = "decode_error"
+            raise OneCError(f"decoding 1C response: {exc}") from exc
 
     def _audit_http(
         self,
@@ -152,6 +238,7 @@ class OneCClient:
         response_bytes: int,
         request_id: str | None,
         error_kind: str | None,
+        attempts: int = 1,
     ) -> None:
         """Пишет ровно одно событие one_c.http. Тело запроса/ответа не логируется."""
         if self._audit is None:
@@ -169,6 +256,7 @@ class OneCClient:
                 "endpoint": endpoint,
                 "response_bytes": response_bytes,
                 "error_kind": error_kind,
+                "attempts": attempts,
             },
         )
 

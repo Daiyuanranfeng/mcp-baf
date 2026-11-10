@@ -209,17 +209,61 @@ def _resolve_tls(config: Config) -> tuple[str, str]:
     return cert, key
 
 
-def _http_security(allowed_hosts: str, scheme: str):
-    """Защита от DNS-rebinding: пусто — выключена (server-to-server по имени сервиса)."""
+def _default_host_names(config: Config) -> list[str]:
+    """Хости, які сервер приймає за замовчуванням.
+
+    localhost/loopback + bind-хост + hostname контейнера/хоста: цього досить
+    для локального запуску, `docker compose` (`mcp-baf:8001`) і публікації порту.
+    """
+    import socket
+
+    names = ["localhost", "127.0.0.1", "[::1]"]
+    if config.http_host not in ("", "0.0.0.0", "::"):
+        bind_host = config.http_host
+        # Host-заголовок для IPv6 приходить у дужках: [::1]:8001.
+        if ":" in bind_host and not bind_host.startswith("["):
+            bind_host = f"[{bind_host}]"
+        if bind_host not in names:
+            names.append(bind_host)
+    try:
+        hostname = socket.gethostname()
+    except OSError:  # pragma: no cover — екзотичне оточення без hostname
+        hostname = ""
+    if hostname and hostname not in names:
+        names.append(hostname)
+    return names
+
+
+def _http_security(config: Config, scheme: str):
+    """Захист від DNS-rebinding: увімкнений за замовчуванням.
+
+    Порожній `--http-allowed-hosts` — набір за замовчуванням (див.
+    `_default_host_names`) плюс шаблони `:*`, щоб публікація іншого порту в
+    Docker не ламала перевірку Host. Вимкнення — лише явним флагом
+    `--disable-dns-rebinding` / `mcp_baf_HTTP_DISABLE_DNS_REBINDING=1`.
+    """
     from mcp.server.transport_security import TransportSecuritySettings
 
-    hosts = [h.strip() for h in allowed_hosts.split(",") if h.strip()]
-    if not hosts:
+    if not config.dns_rebinding_protection:
+        logging.getLogger(__name__).warning(
+            "DNS-rebinding protection disabled (mcp_baf_HTTP_DISABLE_DNS_REBINDING)"
+        )
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    explicit = [h.strip() for h in config.http_allowed_hosts.split(",") if h.strip()]
+    if explicit:
+        hosts = explicit
+        origins = [f"{scheme}://{h}" for h in hosts]
+    else:
+        names = _default_host_names(config)
+        hosts = [f"{n}:{config.http_port}" for n in names]
+        hosts += [f"{n}:*" for n in names]
+        origins = [f"{scheme}://{n}:{config.http_port}" for n in names]
+        origins += [f"{scheme}://{n}:*" for n in names]
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=hosts,
-        allowed_origins=[f"{scheme}://{h}" for h in hosts],
+        allowed_origins=origins,
     )
 
 
@@ -232,7 +276,7 @@ def _run_http(server, config: Config, tls: tuple[str, str] | None) -> None:
         server.streamable_http_app(
             host=config.http_host,
             transport_security=_http_security(
-                config.http_allowed_hosts, "https" if tls else "http"
+                config, "https" if tls else "http"
             ),
         ),
         config.http_token,

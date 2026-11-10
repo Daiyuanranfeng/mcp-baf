@@ -126,3 +126,77 @@ def test_base_dump_error_exits_1(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 1
+
+
+# ── Защита от DNS-rebinding: включена по умолчанию ──
+
+
+def _settings(**kwargs):
+    from mcp_baf.config import Config
+    from mcp_baf.__main__ import _http_security
+
+    return _http_security(Config(**kwargs), "https")
+
+
+def test_dns_rebinding_enabled_by_default():
+    settings = _settings()
+    assert settings.enable_dns_rebinding_protection is True
+    # localhost-сценарии продолжают работать без настройки
+    assert "localhost:8001" in settings.allowed_hosts
+    assert "127.0.0.1:8001" in settings.allowed_hosts
+    assert "[::1]:8001" in settings.allowed_hosts
+    # публикация другого порта в Docker не ломает проверку Host
+    assert "localhost:*" in settings.allowed_hosts
+    assert "https://localhost:8001" in settings.allowed_origins
+
+
+def test_dns_rebinding_default_accepts_bind_host_and_hostname():
+    import socket
+
+    settings = _settings(http_host="192.168.1.10", http_port=9000)
+    assert "192.168.1.10:9000" in settings.allowed_hosts
+    assert f"{socket.gethostname()}:9000" in settings.allowed_hosts
+
+
+def test_dns_rebinding_wildcard_bind_host_is_not_listed():
+    settings = _settings(http_host="0.0.0.0")
+    assert not any(h.startswith("0.0.0.0") for h in settings.allowed_hosts)
+
+
+def test_dns_rebinding_rejects_foreign_host_and_accepts_localhost():
+    """Функциональная проверка тем же middleware, что использует SDK."""
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    mw = TransportSecurityMiddleware(_settings())
+    assert mw._validate_host("localhost:8001") is True
+    assert mw._validate_host("localhost:8443") is True  # шаблон :*
+    assert mw._validate_host("evil.example.com:8001") is False
+    assert mw._validate_origin("https://evil.example.com") is False
+
+
+def test_dns_rebinding_explicit_hosts_replace_defaults():
+    settings = _settings(http_allowed_hosts="mcp-baf:8001, mcp.example.lan:8001")
+    assert settings.allowed_hosts == ["mcp-baf:8001", "mcp.example.lan:8001"]
+    assert settings.allowed_origins == [
+        "https://mcp-baf:8001", "https://mcp.example.lan:8001"]
+
+
+def test_dns_rebinding_can_be_disabled_with_warning(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="mcp_baf.__main__"):
+        settings = _settings(dns_rebinding_protection=False)
+    assert settings.enable_dns_rebinding_protection is False
+    assert any("DNS-rebinding" in r.message for r in caplog.records)
+
+
+def test_dns_rebinding_env_and_cli_switch(monkeypatch):
+    from mcp_baf.config import load_config, parse_args
+
+    monkeypatch.delenv("mcp_baf_HTTP_DISABLE_DNS_REBINDING", raising=False)
+    assert load_config(parse_args([])).dns_rebinding_protection is True
+    monkeypatch.setenv("mcp_baf_HTTP_DISABLE_DNS_REBINDING", "1")
+    assert load_config(parse_args([])).dns_rebinding_protection is False
+    monkeypatch.delenv("mcp_baf_HTTP_DISABLE_DNS_REBINDING")
+    assert load_config(parse_args(["--disable-dns-rebinding"])).dns_rebinding_protection is False
+

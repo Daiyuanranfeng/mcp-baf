@@ -17,6 +17,9 @@ services:
       mcp_baf_TRANSPORT: ${mcp_baf_TRANSPORT:-https}
       mcp_baf_HTTP_HOST: 0.0.0.0
       mcp_baf_HTTP_PORT: 8001
+      # Захист від DNS-rebinding увімкнений типово: приймаються localhost,
+      # 127.0.0.1, [::1], hostname контейнера (mcp-baf) на будь-якому порту.
+      # Інші хости — mcp_baf_HTTP_ALLOWED_HOSTS у .env (замінює типовий набір).
     ports:
       # За замовчуванням лише localhost хоста; MCP_BAF_BIND=0.0.0.0 — для доступу з мережі.
       - "${MCP_BAF_BIND:-127.0.0.1}:${MCP_BAF_PUBLISHED_PORT:-8001}:8001"
