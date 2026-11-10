@@ -66,7 +66,8 @@ class Config:
     # Свои cert/key для https; пусто — самоподписанный CA в <cache_dir>/tls/.
     tls_cert: str = ""
     tls_key: str = ""
-    # Маскирование ПДн (ФИО, ИНН, телефоны, email...) в результатах execute_query.
+    # Маскирование ПДн (ФИО, ИНН, телефоны, email...) в ответах инструментов:
+    # execute_query, журнал регистрации, структура формы, найденный код.
     mask_pii: bool = False
 
 
@@ -121,7 +122,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--help-dir", default="", help="Directory with platform .hbk help files")
     parser.add_argument(
         "--pass", "--password", dest="password", default="",
-        help="1C HTTP service password",
+        help="1C HTTP service password (env mcp_baf_PASSWORD / "
+             "mcp_baf_PASSWORD_FILE is preferred: CLI flags are visible in ps).",
     )
     parser.add_argument(
         "--dump", default="",
@@ -188,7 +190,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--db-password", default="",
-        help="1C database password for DESIGNER (install mode)",
+        help="1C database password for DESIGNER (install mode). Prefer env "
+             "mcp_baf_DB_PASSWORD or mcp_baf_DB_PASSWORD_FILE: a CLI password "
+             "is visible in ps and shell history.",
     )
     parser.add_argument(
         "--max-response-size", type=int, default=0, metavar="MIB",
@@ -217,7 +221,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mask-pii", action="store_true",
-        help="Mask personal data in execute_query results (env mcp_baf_MASK_PII=1).",
+        help="Mask personal data in tool output: execute_query results, event log, "
+             "form structure and found code (env mcp_baf_MASK_PII=1).",
     )
     parser.add_argument(
         "--allow-insecure-http", action="store_true",

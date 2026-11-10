@@ -10,6 +10,7 @@ from pydantic import Field
 
 from mcp_baf_audit import AuditWriter
 from mcp_baf.client import OneCClient
+from mcp_baf.pii import mask_pii_text
 from mcp_baf.tools.common import clamp_limit, traced_text
 
 DEFAULT_EVENT_LOG_LIMIT = 50
@@ -18,7 +19,8 @@ MAX_EVENT_LOG_LIMIT = 500
 EventLogLevel = Literal["Ошибка", "Предупреждение", "Информация", "Примечание"]
 
 
-def register(mcp: MCPServer, client: OneCClient, audit: AuditWriter) -> None:
+def register(mcp: MCPServer, client: OneCClient, audit: AuditWriter,
+             mask_pii: bool = False) -> None:
     @mcp.tool(
         name="get_event_log",
         title="Журнал регистрации",
@@ -67,7 +69,7 @@ def register(mcp: MCPServer, client: OneCClient, audit: AuditWriter) -> None:
                 body["user"] = user
 
             result = await client.post("/eventlog", body)
-            return format_event_log(result)
+            return format_event_log(result, mask_pii=mask_pii)
 
         return await traced_text(
             audit, "get_event_log", run,
@@ -82,7 +84,17 @@ def register(mcp: MCPServer, client: OneCClient, audit: AuditWriter) -> None:
         )
 
 
-def format_event_log(r: dict[str, Any]) -> str:
+def format_event_log(r: dict[str, Any], mask_pii: bool = False) -> str:
+    """Форматирует журнал; при mask_pii телефон/email в полях скрываются.
+
+    Журнал регистрации — канал утечки ПДн: в «Данные» и «Комментарий»
+    попадают телефоны клиентов, email и адреса из сообщений платформы.
+    Маскирование идёт по значению (regex), имена полей не трогаются —
+    иначе агент потеряет возможность фильтровать по пользователю.
+    """
+    def cell(value: Any) -> str:
+        return mask_pii_text(value) if mask_pii else str(value or "")
+
     lines = ["## Журнал регистрации", ""]
 
     events = r.get("events") or []
@@ -94,9 +106,9 @@ def format_event_log(r: dict[str, Any]) -> str:
         if i > 0:
             lines.extend(["", "---", ""])
         lines.append(
-            f"**{e.get('date', '')}** | {e.get('level', '')} | {e.get('event', '')}"
+            f"**{cell(e.get('date'))}** | {cell(e.get('level'))} | {cell(e.get('event'))}"
         )
-        lines.append(f"- Пользователь: {e.get('user', '')}")
+        lines.append(f"- Пользователь: {cell(e.get('user'))}")
         for key, label in (
             ("computer", "Компьютер"),
             ("metadata", "Метаданные"),
@@ -105,7 +117,7 @@ def format_event_log(r: dict[str, Any]) -> str:
             ("transaction", "Транзакция"),
         ):
             if e.get(key):
-                lines.append(f"- {label}: {e[key]}")
+                lines.append(f"- {label}: {cell(e[key])}")
 
     lines.append("")
     events_count = len(events)

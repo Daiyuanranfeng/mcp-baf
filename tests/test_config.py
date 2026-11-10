@@ -109,3 +109,12 @@ def test_dump_extensions_flag_forms():
     assert a.dump_extensions == "all"
     a = parse_args(["--install", "db", "--dump", "/x", "--dump-extensions", "A,B"])
     assert a.dump_extensions == "A,B"
+
+
+def test_password_flags_help_warns_about_ps(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--help"])
+    out = capsys.readouterr().out
+    # пароль сервиса и пароль базы: оба флага видны в ps — предупреждаем
+    assert "--pass" in out and "visible in ps" in out
+    assert "--db-password" in out and "mcp_baf_DB_PASSWORD_FILE" in out

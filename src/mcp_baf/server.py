@@ -167,11 +167,11 @@ def create_server(config: Config) -> MCPServer:
     object_structure.register(mcp, client, audit)
     query.register(mcp, client, audit, config.mask_pii)
     if index is not None:
-        search_code.register(mcp, index, audit)
+        search_code.register(mcp, index, audit, config.mask_pii)
     # dump-директория позволяет form-инструменту обогащать ответ из Form.xml.
-    form.register(mcp, client, audit, config.dump_dir)
+    form.register(mcp, client, audit, config.dump_dir, config.mask_pii)
     validate_query.register(mcp, client, audit)
-    eventlog.register(mcp, client, audit)
+    eventlog.register(mcp, client, audit, config.mask_pii)
     configuration_info.register(mcp, client, audit)
     bsl_help.register(mcp, audit)
     objects.register(mcp, client, audit)

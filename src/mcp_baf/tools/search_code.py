@@ -11,13 +11,15 @@ from pydantic import Field
 
 from mcp_baf_audit import AuditWriter
 from mcp_baf.dumpindex import DumpIndex, Match, SearchParams
+from mcp_baf.pii import mask_pii_text
 from mcp_baf.tools.common import clamp_limit, traced_text
 
 DEFAULT_SEARCH_LIMIT = 50
 MAX_SEARCH_LIMIT = 500
 
 
-def register(mcp: MCPServer, index: DumpIndex, audit: AuditWriter) -> None:
+def register(mcp: MCPServer, index: DumpIndex, audit: AuditWriter,
+             mask_pii: bool = False) -> None:
     @mcp.tool(
         name="search_code",
         title="Поиск по коду модулей",
@@ -82,7 +84,7 @@ def register(mcp: MCPServer, index: DumpIndex, audit: AuditWriter) -> None:
                     "Проверьте путь к выгрузке конфигурации."
                 )
 
-            return format_search_result(matches, total, query, mode)
+            return format_search_result(matches, total, query, mode, mask_pii=mask_pii)
 
         return await traced_text(
             audit, "search_code", run,
@@ -97,9 +99,18 @@ def register(mcp: MCPServer, index: DumpIndex, audit: AuditWriter) -> None:
 
 
 def format_search_result(
-    matches: list[Match], total: int, query: str, mode: str
+    matches: list[Match], total: int, query: str, mode: str,
+    mask_pii: bool = False,
 ) -> str:
-    lines = [f'## Результаты поиска "{query}" ({total} совпадений)', ""]
+    """Форматирует результаты поиска; при mask_pii код маскируется по regex.
+
+    В коде модулей встречаются литералы с телефонами и email (шаблоны писем,
+    реквизиты контрагентов), поэтому при --mask-pii они заменяются токенами.
+    """
+    def text(value: str) -> str:
+        return mask_pii_text(value) if mask_pii else value
+
+    lines = [f'## Результаты поиска "{text(query)}" ({total} совпадений)', ""]
 
     if not matches:
         lines.append("Ничего не найдено.")
@@ -111,7 +122,7 @@ def format_search_result(
         else:
             lines.append(f"### {m.module} (строка {m.line})")
         lines.append("```bsl")
-        lines.append(m.context)
+        lines.append(text(m.context))
         lines.append("```")
         lines.append("")
 

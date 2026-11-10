@@ -311,7 +311,7 @@ def test_designer_fatal_log_is_detected_even_with_zero_exit(message):
 def test_run_designer_fails_closed_on_zero_exit_fatal_log(monkeypatch):
     from types import SimpleNamespace
 
-    def fake_run(argv, capture_output):
+    def fake_run(argv, capture_output, timeout=None):
         with open(argv[argv.index("/Out") + 1], "w", encoding="utf-8") as log:
             log.write("Невідомий об’єкт метаданих - Catalog.Номенклатура")
         return SimpleNamespace(returncode=0)
@@ -472,3 +472,151 @@ def test_dump_all_skips_root_files_and_blocked_target(monkeypatch, tmp_path):
     # службовий файл з кореня вивантажки не «розширення»
     assert "ConfigDumpInfo.xml" not in result["extensions"]
     assert not (out / "ConfigDumpInfo.xml").exists()
+
+
+# --- Выбор платформы: версия, а не лексикографический порядок строк ---
+
+def test_newest_platform_sorts_by_version_not_string():
+    paths = [
+        "/opt/1cv8/x86_64/8.3.9.100/1cv8",
+        "/opt/1cv8/x86_64/8.3.14.100/1cv8",
+        "/opt/1cv8/x86_64/8.3.10.100/1cv8",
+    ]
+    # строкой «8.3.9» > «8.3.14», версией — наоборот
+    assert installer.newest_platform(paths) == paths[1]
+
+
+def test_newest_platform_prefers_higher_build():
+    paths = [
+        "/opt/1cv8/x86_64/8.3.14.100/1cv8",
+        "/opt/1cv8/x86_64/8.3.14.1627/1cv8",
+    ]
+    assert installer.newest_platform(paths) == paths[1]
+
+
+def test_newest_platform_without_version_never_wins():
+    paths = ["/opt/1cv8/x86_64/broken/1cv8", "/opt/1cv8/x86_64/8.3.5/1cv8"]
+    assert installer.newest_platform(paths) == paths[1]
+
+
+def test_find_platform_uses_version_order(monkeypatch):
+    found = [
+        "/opt/1cv8/x86_64/8.3.9.100/1cv8",
+        "/opt/1cv8/x86_64/8.3.14.100/1cv8",
+    ]
+    monkeypatch.setattr(installer, "_platform_patterns",
+                        lambda: ["/opt/1cv8/x86_64/8.*/1cv8"])
+    monkeypatch.setattr(installer.glob, "glob", lambda pattern: found)
+    assert installer.find_platform() == found[1]
+
+
+def test_find_platform_keeps_pattern_priority(monkeypatch):
+    monkeypatch.setattr(installer, "_platform_patterns", lambda: ["a/*", "b/*"])
+
+    def fake_glob(pattern):
+        return ["a/8.3.5/1cv8"] if pattern == "a/*" else ["b/8.3.27/1cv8"]
+
+    monkeypatch.setattr(installer.glob, "glob", fake_glob)
+    # BAF раньше 1cv8: старый BAF приоритетнее новой 1cv8 из другого шаблона
+    assert installer.find_platform() == "a/8.3.5/1cv8"
+
+
+# --- Таймаут DESIGNER ---
+
+def _timeout_run(monkeypatch, calls):
+    def fake_run(argv, capture_output, timeout=None):
+        calls.append(timeout)
+        raise installer.subprocess.TimeoutExpired(argv[0], timeout)
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+
+def test_run_designer_timeout_reports_clear_error(monkeypatch):
+    calls = []
+    _timeout_run(monkeypatch, calls)
+    error = installer._run_designer(
+        "1cv8.exe", "C:\\db", False, "", "", "/DumpConfigToFiles", "out"
+    )
+    assert error is not None
+    assert "таймаут" in error
+    assert "mcp_baf_DESIGNER_TIMEOUT" in error
+    assert calls == [installer.DEFAULT_DESIGNER_TIMEOUT]
+
+
+def test_run_designer_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("mcp_baf_DESIGNER_TIMEOUT", "42")
+    calls = []
+    _timeout_run(monkeypatch, calls)
+    error = installer._run_designer(
+        "1cv8.exe", "C:\\db", False, "", "", "/DumpConfigToFiles", "out"
+    )
+    assert error is not None and "42" in error
+    assert calls == [42]
+
+
+def test_designer_timeout_ignores_bad_env(monkeypatch):
+    for raw in ("", "abc", "0", "-5"):
+        monkeypatch.setenv("mcp_baf_DESIGNER_TIMEOUT", raw)
+        assert installer.designer_timeout() == installer.DEFAULT_DESIGNER_TIMEOUT
+
+
+# --- Пароль базы: файл/оточение вместо argv ---
+
+def test_db_password_from_file_strips_trailing_newline(monkeypatch, tmp_path):
+    secret = tmp_path / "db-pass"
+    secret.write_text("s3cret\n\n", encoding="utf-8")
+    monkeypatch.delenv("mcp_baf_DB_PASSWORD", raising=False)
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD_FILE", str(secret))
+    assert installer.resolve_db_password() == "s3cret"
+
+
+def test_db_password_plain_env(monkeypatch):
+    monkeypatch.delenv("mcp_baf_DB_PASSWORD_FILE", raising=False)
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD", "env-pass")
+    assert installer.resolve_db_password() == "env-pass"
+
+
+def test_db_password_env_and_file_conflict(monkeypatch, tmp_path):
+    secret = tmp_path / "p"
+    secret.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD", "a")
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD_FILE", str(secret))
+    with pytest.raises(installer.InstallError, match="mcp_baf_DB_PASSWORD_FILE"):
+        installer.resolve_db_password()
+
+
+def test_db_password_missing_file_error_names_path(monkeypatch, tmp_path):
+    monkeypatch.delenv("mcp_baf_DB_PASSWORD", raising=False)
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD_FILE", str(tmp_path / "nope"))
+    with pytest.raises(installer.InstallError) as exc:
+        installer.resolve_db_password()
+    assert "mcp_baf_DB_PASSWORD_FILE" in str(exc.value)
+    assert "nope" in str(exc.value)
+
+
+def test_db_password_cli_wins_and_warns(monkeypatch, capsys):
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD", "env-pass")
+    assert installer.resolve_db_password("cli-pass") == "cli-pass"
+    err = capsys.readouterr().err
+    assert "ps" in err and "mcp_baf_DB_PASSWORD_FILE" in err
+
+
+def test_build_designer_args_keeps_password_flag():
+    args = installer._build_designer_args("db", False, "u", "p", "log")
+    assert args[args.index("/P") + 1] == "p"
+
+
+def test_install_uses_password_file(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_install_from(ext_dir, platform_exe, db_path, server_mode,
+                          db_user, db_password, platform_version, lang):
+        captured["db_password"] = db_password
+
+    monkeypatch.setattr(installer, "_install_from", fake_install_from)
+    secret = tmp_path / "db-pass"
+    secret.write_text("file-pass\n", encoding="utf-8")
+    monkeypatch.delenv("mcp_baf_DB_PASSWORD", raising=False)
+    monkeypatch.setenv("mcp_baf_DB_PASSWORD_FILE", str(secret))
+    installer.install("C:\\db", platform_exe="1cv8.exe")
+    assert captured["db_password"] == "file-pass"

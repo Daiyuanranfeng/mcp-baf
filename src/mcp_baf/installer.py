@@ -4,6 +4,11 @@ XML-исходники расширения распаковываются во 
 версию целевой платформы (версия формата выгрузки, режим совместимости,
 неподдерживаемые элементы) и загружаются командой /LoadConfigFromFiles с
 цепочкой повторов под известные ошибки старых платформ.
+
+Пароль базы DESIGNER получает аргументом /P командной строки, поэтому он
+виден в ps и в истории оболочки. Предпочтительный способ — файл:
+mcp_baf_DB_PASSWORD_FILE=/path/to/secret (или mcp_baf_DB_PASSWORD);
+--db-password оставлен для совместимости и печатает предупреждение.
 """
 
 from __future__ import annotations
@@ -18,6 +23,16 @@ import tempfile
 import unicodedata
 
 EXTENSION_NAME = "MCP_HTTPService"
+
+# Таймаут одного запуска DESIGNER, секунды (15 минут). Загрузка крупной
+# конфигурации идёт минутами, но зависший DESIGNER без потолка держит
+# установку вечно и не даёт отличить «ещё работает» от «повис».
+DEFAULT_DESIGNER_TIMEOUT = 900
+
+# Переменные окружения с паролем базы DESIGNER. _FILE — путь к файлу
+# (Docker secrets); содержимое читается без argv, поэтому не видно в ps.
+_DB_PASSWORD_ENV = "mcp_baf_DB_PASSWORD"
+_DB_PASSWORD_FILE_ENV = "mcp_baf_DB_PASSWORD_FILE"
 
 # Каталог с XML-исходниками расширения (копия extension/src из Go-версии).
 EXTENSION_SRC = os.path.join(os.path.dirname(__file__), "extension_src")
@@ -96,6 +111,9 @@ _VERSION_ATTR_RE = re.compile(r'(version=")2\.\d+(?:\.\d+)?(")')
 # 8.Major.Minor из пути к платформе или строки версии.
 _PLATFORM_VERSION_RE = re.compile(r"8\.(\d+)\.(\d+)")
 
+# Полная версия 8.Major.Minor[.Build] — ключ выбора самой новой платформы.
+_PLATFORM_FULL_VERSION_RE = re.compile(r"8\.(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+
 # Элементы, появившиеся в 8.3.15, которые отвергают старые платформы.
 _KEEP_MAPPING_RE = re.compile(
     r"\s*<KeepMappingToExtendedConfigurationObjectsByIDs>[^<]*"
@@ -169,6 +187,61 @@ def _designer_log_is_fatal(log: str) -> bool:
     return bool(_DESIGNER_FATAL_LOG_RE.search(log))
 
 
+def resolve_db_password(cli_password: str = "") -> str:
+    """Пароль базы для DESIGNER: CLI > mcp_baf_DB_PASSWORD > _FILE.
+
+    DESIGNER принимает пароль только аргументом /P, поэтому он неизбежно
+    виден в ps, пока процесс жив. Задача — не передавать его через CLI:
+    файл (Docker/K8s secret) или переменная окружения не попадают в argv
+    нашего процесса, и пароль не остаётся в истории оболочки.
+
+    --db-password оставлен рабочим для совместимости, но печатает
+    предупреждение в stderr. Одновременное задание env и _FILE — ошибка:
+    непонятно, какой источник главнее. Текст ошибки называет переменную и
+    путь, но никогда не содержимое.
+    """
+    if cli_password:
+        print(
+            "Внимание: --db-password попадает в ps и в историю команд. "
+            f"Надёжнее {_DB_PASSWORD_FILE_ENV}=/path/to/secret "
+            f"(или {_DB_PASSWORD_ENV}).",
+            file=sys.stderr,
+        )
+        return cli_password
+
+    value = os.environ.get(_DB_PASSWORD_ENV, "")
+    path = os.environ.get(_DB_PASSWORD_FILE_ENV, "")
+    if not path:
+        return value
+    if value:
+        raise InstallError(
+            f"задайте лише одне з {_DB_PASSWORD_ENV} / {_DB_PASSWORD_FILE_ENV}"
+        )
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().rstrip("\r\n")
+    except (OSError, UnicodeDecodeError) as exc:
+        # str(exc) у UnicodeDecodeError содержит байты файла — берём тип.
+        raise InstallError(
+            f"{_DB_PASSWORD_FILE_ENV}: не вдалося прочитати файл {path} "
+            f"({type(exc).__name__})"
+        ) from None
+
+
+def designer_timeout() -> int:
+    """Таймаут DESIGNER: mcp_baf_DESIGNER_TIMEOUT (сек), иначе 15 минут.
+
+    Некорректные и неположительные значения игнорируются — остаётся
+    значение по умолчанию, чтобы опечатка не отключила защиту от зависания.
+    """
+    raw = os.environ.get("mcp_baf_DESIGNER_TIMEOUT", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_DESIGNER_TIMEOUT
+    return value if value > 0 else DEFAULT_DESIGNER_TIMEOUT
+
+
 def install(
     db_path: str,
     server_mode: bool = False,
@@ -185,12 +258,17 @@ def install(
     когда версию нельзя определить из пути. При server_mode=True база
     считается клиент-серверной и DESIGNER вызывается с /S вместо /F.
     lang — язык синонимов расширения: "ua" (по умолчанию) или "ru".
+
+    db_password: пусто — берётся из mcp_baf_DB_PASSWORD или
+    mcp_baf_DB_PASSWORD_FILE. Явный --db-password уходит в argv DESIGNER
+    (/P) и виден в ps, поэтому предпочтителен файл.
     """
     if lang not in SUPPORTED_LANGS:
         raise InstallError(
             f"unsupported --lang value: {lang!r} "
             f"(supported: {', '.join(SUPPORTED_LANGS)})"
         )
+    db_password = resolve_db_password(db_password)
     if not platform_exe:
         platform_exe = find_platform()
     print(f"Platform: {platform_exe}")
@@ -249,7 +327,11 @@ def dump(
     Возвращает {"base_error": str|None, "extensions": {имя: str|None}};
     при ошибке выгрузки основной конфигурации бросает InstallError —
     без неё искать нечего.
+
+    db_password: пусто — берётся из mcp_baf_DB_PASSWORD или
+    mcp_baf_DB_PASSWORD_FILE (см. resolve_db_password).
     """
+    db_password = resolve_db_password(db_password)
     # Имена расширений в 1С регистронезависимы — дубль означал бы повторную выгрузку.
     names = list({_safe_extension_name(n).casefold(): _safe_extension_name(n)
                   for n in (extensions or [])}.values()) \
@@ -519,10 +601,20 @@ def _run_designer(
         args = _build_designer_args(
             db_path, server_mode, db_user, db_password, log_path, *extra_args
         )
+        timeout = designer_timeout()
         try:
-            result = subprocess.run([platform_exe, *args], capture_output=True)
+            result = subprocess.run(
+                [platform_exe, *args], capture_output=True, timeout=timeout
+            )
         except OSError:
             return f"1C DESIGNER failed to start: {platform_exe}"
+        except subprocess.TimeoutExpired:
+            return (
+                f"1C DESIGNER не завершился за {timeout} с (таймаут).\n"
+                "База могла остаться занятой: закройте сеансы Конфигуратора "
+                "и повторные попытки установки, затем повторите запуск.\n"
+                "Увеличить лимит: mcp_baf_DESIGNER_TIMEOUT=<секунды>."
+            )
 
         try:
             with open(log_path, "rb") as f:
@@ -580,13 +672,33 @@ def _build_designer_args(
 def find_platform() -> str:
     """Ищет исполняемый файл платформы BAF/1С в стандартных путях текущей ОС.
 
-    Возвращает последний (лексикографически — самый новый) из найденных.
+    В каждом каталоге берётся самый новый по версии, а не по строке:
+    лексикографически «8.3.9» больше «8.3.14», из-за чего старый билд
+    перекрывал новый. Порядок шаблонов по-прежнему задаёт приоритет
+    (BAF раньше 1cv8), поэтому первый непустой шаблон выигрывает.
     """
     for pattern in _platform_patterns():
         matches = sorted(glob.glob(pattern))
         if matches:
-            return matches[-1]
+            return newest_platform(matches)
     raise InstallError("1C platform not found in standard paths")
+
+
+def _platform_version_key(path: str) -> tuple[int, ...]:
+    """Ключ сортировки платформ: числовые компоненты версии 8.x.y.z.
+
+    Путь без версии получает ключ (0, 0, 0, 0) — он всегда младше любой
+    распознанной платформы, но не роняет сортировку.
+    """
+    m = _PLATFORM_FULL_VERSION_RE.search(path)
+    if m is None:
+        return (0, 0, 0, 0)
+    return tuple(int(g or 0) for g in m.groups())
+
+
+def newest_platform(matches: list[str]) -> str:
+    """Выбирает путь с наибольшей версией: 8.3.14 новее 8.3.9."""
+    return max(matches, key=_platform_version_key)
 
 
 def _platform_patterns() -> list[str]:

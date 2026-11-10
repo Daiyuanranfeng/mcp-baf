@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
-import secrets
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
@@ -13,6 +11,7 @@ from pydantic import Field
 
 from mcp_baf_audit import AuditWriter
 from mcp_baf.client import OneCClient
+from mcp_baf.pii import mask_pii_result
 from mcp_baf.tools.common import clamp_limit, escape_pipe, format_cell, traced_text
 
 DEFAULT_QUERY_LIMIT = 100
@@ -32,58 +31,6 @@ def query_keyword(query: str) -> str:
     text = _QUERY_COMMENT_RE.sub(" ", query)
     match = _FIRST_WORD_RE.match(text.lstrip())
     return match.group(0).upper() if match else ""
-
-
-# Подстроки имён колонок с персональными данными (сравнение без регистра).
-# shortcut: ПІБ у полі Наименование (фізособи-контрагенти) не маскується — лише за назвою колонки; розширити, якщо агент виводить Наименование фізосіб
-PII_COLUMN_MARKERS = tuple(m.lower() for m in (
-    "ФИО", "ПІБ", "ИНН", "ІПН", "РНОКПП", "КодПоДРФО", "ДатаРождения",
-    "ДатаНародження", "Телефон", "Email", "ЭлектроннаяПочта", "Паспорт",
-    "ДокументУдостоверяющий", "Адрес",
-))
-# Украинские телефоны (+380XXXXXXXXX, 0XXXXXXXXX с пробелами/дефисами/скобками) и email.
-PII_VALUE_RE = re.compile(
-    r"(?<!\d)(?:\+?38[\s-]*)?\(?0[\s-]*\d[\s-]*\d\)?(?:[\s-]*\d){7}(?!\d)"
-    r"|[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
-)
-# Соль случайная на процесс: токены стабильны внутри сессии, но не подбираются по словарю.
-_PII_SALT = secrets.token_hex(16)
-
-
-def _pii_token(value: Any) -> str:
-    digest = hashlib.sha256((_PII_SALT + str(value)).encode()).hexdigest()
-    return f"PII:{digest[:8]}"
-
-
-def mask_pii_result(r: dict[str, Any]) -> dict[str, Any]:
-    """Маскирует ПДн в строках результата: по имени колонки и по regex в строках."""
-    columns = r.get("columns") or []
-    sensitive = [
-        any(m in str(c).rsplit(".", 1)[-1].lower() for m in PII_COLUMN_MARKERS)
-        for c in columns
-    ]
-
-    def mask(i: int, v: Any) -> Any:
-        if v is None or v == "":
-            return v
-        if i < len(sensitive) and sensitive[i]:
-            return _pii_token(v)
-        if isinstance(v, str):
-            return PII_VALUE_RE.sub(lambda m: _pii_token(m.group()), v)
-        return v
-
-    rows = r.get("rows")
-    if rows is None:
-        rows = []
-    # Молчаливый пропуск маскирования — утечка ПДн: контракт должен падать явно.
-    if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
-        raise ValueError(
-            "execute_query: ответ 1С содержит rows не в виде списка списков — "
-            "маскирование ПДн невозможно. Отключите --mask-pii или проверьте "
-            "контракт расширения (/query)."
-        )
-    masked = [[mask(i, v) for i, v in enumerate(row)] for row in rows]
-    return {**r, "rows": masked}
 
 
 def register(mcp: MCPServer, client: OneCClient, audit: AuditWriter,

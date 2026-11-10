@@ -21,6 +21,7 @@ from mcp_baf_audit import AuditWriter
 from mcp_baf.client import OneCClient, OneCError
 from mcp_baf.dumpindex import formparser
 from mcp_baf.dumpindex.modulenames import OBJECT_TYPE_TO_DUMP_DIR, nfc
+from mcp_baf.pii import mask_pii_text
 from mcp_baf.tools.common import (
     escape_pipe, object_path_segments, traced_text, truncate_output,
 )
@@ -29,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 def register(
-    mcp: MCPServer, client: OneCClient, audit: AuditWriter, dump_dir: str = ""
+    mcp: MCPServer, client: OneCClient, audit: AuditWriter, dump_dir: str = "",
+    mask_pii: bool = False,
 ) -> None:
     @mcp.tool(
         name="get_form_structure",
@@ -102,7 +104,9 @@ def register(
                     f"fetching form structure from 1C: {http_error}"
                 ) from http_error
 
-            return truncate_output(format_form_structure(form) + dump_note)
+            return truncate_output(
+                format_form_structure(form, mask_pii=mask_pii) + dump_note
+            )
 
         return await traced_text(
             audit, "get_form_structure", run,
@@ -179,10 +183,20 @@ def merge_dump_into_form(form: dict[str, Any], dump_form: dict[str, Any]) -> Non
             form[key] = dump_form[key]
 
 
-def format_form_structure(f: dict[str, Any]) -> str:
-    lines = [f"# Форма: {f.get('name', '')}"]
+def format_form_structure(f: dict[str, Any], mask_pii: bool = False) -> str:
+    """Форматирует структуру формы; при mask_pii свободный текст маскируется.
+
+    Заголовки, пути к данным и обработчики берутся из Form.xml — там могут
+    оказаться телефоны/email из настроек формы, поэтому при --mask-pii они
+    проходят ту же regex-маскировку, что и журнал регистрации.
+    """
+    def cell(value: Any) -> str:
+        text = mask_pii_text(value) if mask_pii else str(value or "")
+        return escape_pipe(text)
+
+    lines = [f"# Форма: {cell(f.get('name'))}"]
     if f.get("title"):
-        lines.append(f"**Заголовок:** {f['title']}")
+        lines.append(f"**Заголовок:** {cell(f['title'])}")
     lines.append("")
 
     elements = f.get("elements") or []
@@ -194,10 +208,10 @@ def format_form_structure(f: dict[str, Any]) -> str:
         for e in elements:
             lines.append(
                 "| {} | {} | {} | {} |".format(
-                    escape_pipe(e.get("name", "")),
-                    escape_pipe(e.get("type", "")),
-                    escape_pipe(e.get("title", "")),
-                    escape_pipe(e.get("dataPath", "")),
+                    cell(e.get("name")),
+                    cell(e.get("type")),
+                    cell(e.get("title")),
+                    cell(e.get("dataPath")),
                 )
             )
         lines.append("")
@@ -214,7 +228,8 @@ def format_form_structure(f: dict[str, Any]) -> str:
             lines.append("")
             for name, ev in element_events:
                 lines.append(
-                    f"- **{name}** (`{ev.get('event', '')}`) → {ev.get('handler', '')}()"
+                    f"- **{cell(name)}** (`{cell(ev.get('event'))}`) → "
+                    f"{cell(ev.get('handler'))}()"
                 )
             lines.append("")
 
@@ -223,7 +238,9 @@ def format_form_structure(f: dict[str, Any]) -> str:
         lines.append("## Команды формы")
         lines.append("")
         for c in commands:
-            lines.append(f"- **{c.get('name', '')}** → {c.get('action', '')}")
+            lines.append(
+                f"- **{cell(c.get('name'))}** → {cell(c.get('action'))}"
+            )
         lines.append("")
 
     handlers = f.get("handlers") or []
@@ -231,7 +248,9 @@ def format_form_structure(f: dict[str, Any]) -> str:
         lines.append("## Обработчики событий")
         lines.append("")
         for h in handlers:
-            lines.append(f"- **{h.get('event', '')}** → {h.get('handler', '')}()")
+            lines.append(
+                f"- **{cell(h.get('event'))}** → {cell(h.get('handler'))}()"
+            )
         lines.append("")
 
     return "\n".join(lines) + "\n"
