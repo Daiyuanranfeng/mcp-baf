@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from typing import Any
+from urllib.parse import quote
 
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_baf_audit import AuditWriter, get_trace_id, new_trace_id, set_trace_id
@@ -67,6 +69,58 @@ def clamp_limit(value: int, default: int, maximum: int) -> int:
     if value <= 0:
         return default
     return min(value, maximum)
+
+
+# Имя объекта метаданных 1С: буква или подчёркивание, затем буквы/цифры/подчёркивания.
+METADATA_NAME_RE = re.compile(r"^[^\W\d]\w*$", re.UNICODE)
+
+# Потолок вывода инструментов: огромное дерево/структура не должно вытеснять
+# из контекста агента всё остальное. Усечение всегда явно помечено в тексте.
+MAX_TOOL_OUTPUT_CHARS = 60_000
+
+
+def validate_metadata_name(value: str, field: str) -> str:
+    """Проверяет имя объекта метаданных перед подстановкой в URL/путь."""
+    if not isinstance(value, str) or not METADATA_NAME_RE.fullmatch(value):
+        raise ValueError(
+            f"{field}: ожидается имя объекта метаданных — буква или подчёркивание, "
+            "затем буквы, цифры и подчёркивания (без пробелов, точек и слэшей)"
+        )
+    return value
+
+
+def validate_metadata_type(value: str, allowed: Collection[str]) -> str:
+    """Проверяет тип объекта по белому списку поддерживаемых типов."""
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(
+            "object_type: ожидается один из типов: " + ", ".join(sorted(allowed))
+        )
+    return value
+
+
+def object_path_segments(
+    object_type: str, object_name: str, allowed: Collection[str]
+) -> tuple[str, str]:
+    """Валидирует тип и имя объекта и возвращает percent-encoded URL-сегменты."""
+    object_type = validate_metadata_type(object_type, allowed)
+    object_name = validate_metadata_name(object_name, "object_name")
+    return quote(object_type, safe=""), quote(object_name, safe="")
+
+
+def truncate_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Обрезает вывод по лимиту, сохраняя целые строки и явную пометку."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    newline = cut.rfind("\n")
+    if newline > limit // 2:
+        cut = cut[:newline]
+    return (
+        cut
+        + "\n\n> Результат усечён: превышен лимит вывода "
+        f"({limit} символов). Показана только часть — уточните запрос "
+        "(filter/limit), чтобы получить полный список.\n"
+    )
 
 
 def escape_pipe(s: str) -> str:

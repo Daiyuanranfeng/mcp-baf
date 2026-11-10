@@ -9,7 +9,7 @@ from mcp.types import ToolAnnotations
 
 from mcp_baf_audit import AuditWriter
 from mcp_baf.client import OneCClient
-from mcp_baf.tools.common import traced_text
+from mcp_baf.tools.common import escape_pipe, traced_text
 
 _MODE_NAMES = {
     "file": "Файловый",
@@ -46,7 +46,10 @@ def format_configuration_info(info: dict[str, Any]) -> str:
 
     def add_row(key: str, value: str) -> None:
         if value:
-            lines.append(f"| {key} | {value} |")
+            # Значения приходят из конфигурации: экранируем трубу и переводы строк,
+            # иначе одна ячейка ломает всю markdown-таблицу.
+            cell = escape_pipe(str(value)).replace("\r", " ").replace("\n", " ")
+            lines.append(f"| {escape_pipe(key)} | {cell} |")
 
     add_row("Конфигурация", info.get("name", ""))
     add_row("Версия", info.get("version", ""))

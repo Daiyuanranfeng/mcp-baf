@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,28 @@ if TYPE_CHECKING:  # тип только для подсказок — без о
     from mcp_baf_audit import AuditWriter
 
 _MIB = 1 << 20
+
+# Клиенту показываем лишь короткий фрагмент тела ошибки 1С: полный ответ
+# может содержать данные базы (ПДн, тексты документов) и не нужен агенту.
+MAX_ERROR_DETAIL_CHARS = 300
+
+# Телефоны/почта в тексте ошибки 1С маскируются: тело ответа может включать ПДн.
+_ERROR_PII_RE = re.compile(
+    r"(?<!\d)(?:\+?38[\s-]*)?\(?0[\s-]*\d[\s-]*\d\)?(?:[\s-]*\d){7}(?!\d)"
+    r"|[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+)
+# Управляющие символы (в т.ч. переводы строк) превращаем в пробел: аудит и
+# текст ошибки должны оставаться однострочными.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]+")
+
+
+def scrub_error_detail(detail: str, limit: int = MAX_ERROR_DETAIL_CHARS) -> str:
+    """Маскирует ПДн и обрезает тело ошибки 1С до безопасной длины."""
+    text = " ".join(_CONTROL_RE.sub(" ", detail).split())
+    text = _ERROR_PII_RE.sub("***", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
 
 
 class OneCError(Exception):
@@ -76,7 +99,8 @@ class OneCClient:
         # Состояние для ровно одного события one_c.http (пишется в finally).
         status_code: int | None = None
         response_bytes = 0
-        error_text: str | None = None
+        # В аудит уходит только тип ошибки (и статус), но не её текст.
+        error_kind: str | None = None
         try:
             try:
                 async with self._http.stream(
@@ -84,9 +108,13 @@ class OneCClient:
                 ) as resp:
                     status_code = resp.status_code
                     if resp.status_code != 200:
-                        detail = (await resp.aread())[:4096].decode("utf-8", "replace")
-                        error_text = f"1C returned status {resp.status_code}: {detail}"
-                        raise OneCError(error_text)
+                        detail = scrub_error_detail(
+                            (await resp.aread())[:4096].decode("utf-8", "replace")
+                        )
+                        error_kind = f"http_{resp.status_code}"
+                        raise OneCError(
+                            f"1C returned status {resp.status_code}: {detail}"
+                        )
 
                     # Читаем не более limit+1 байт: если поток обрезан потолком,
                     # выдаём понятную ошибку вместо невнятной ошибки декодера.
@@ -95,22 +123,24 @@ class OneCClient:
                         raw.extend(chunk)
                         if len(raw) > self._max_response_size:
                             response_bytes = len(raw)
-                            error_text = self._response_too_large_message()
-                            raise OneCError(error_text)
+                            error_kind = "response_too_large"
+                            raise OneCError(self._response_too_large_message())
                     response_bytes = len(raw)
             except httpx.HTTPError as exc:
-                error_text = f"executing request to 1C: {exc}"
-                raise OneCError(error_text) from exc
+                error_kind = "transport_error"
+                raise OneCError(
+                    f"executing request to 1C: {scrub_error_detail(str(exc))}"
+                ) from exc
 
             try:
                 return json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError) as exc:
-                error_text = f"decoding 1C response: {exc}"
-                raise OneCError(error_text) from exc
+                error_kind = "decode_error"
+                raise OneCError(f"decoding 1C response: {exc}") from exc
         finally:
             self._audit_http(
                 method, endpoint, status_code, elapsed_ms(),
-                response_bytes, request_id, error_text,
+                response_bytes, request_id, error_kind,
             )
 
     def _audit_http(
@@ -121,23 +151,24 @@ class OneCClient:
         duration_ms: int,
         response_bytes: int,
         request_id: str | None,
-        error: str | None,
+        error_kind: str | None,
     ) -> None:
         """Пишет ровно одно событие one_c.http. Тело запроса/ответа не логируется."""
         if self._audit is None:
             return
         self._audit.event(
             "one_c.http",
-            level="error" if error else "info",
-            ok=error is None,
+            level="error" if error_kind else "info",
+            ok=error_kind is None,
             request_id=request_id or None,
             status=status,
             duration_ms=duration_ms,
-            error=error,
+            error=error_kind,
             payload={
                 "method": method,
                 "endpoint": endpoint,
                 "response_bytes": response_bytes,
+                "error_kind": error_kind,
             },
         )
 

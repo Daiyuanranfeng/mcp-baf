@@ -20,8 +20,10 @@ from pydantic import Field
 from mcp_baf_audit import AuditWriter
 from mcp_baf.client import OneCClient, OneCError
 from mcp_baf.dumpindex import formparser
-from mcp_baf.dumpindex.modulenames import nfc
-from mcp_baf.tools.common import escape_pipe, traced_text
+from mcp_baf.dumpindex.modulenames import OBJECT_TYPE_TO_DUMP_DIR, nfc
+from mcp_baf.tools.common import (
+    escape_pipe, object_path_segments, traced_text, truncate_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +58,16 @@ def register(
             raise ValueError("object_type and object_name are required")
 
         async def run() -> str:
+            # Оба сегмента подставляются в URL: белый список типов + имя по регексу.
+            url_type, url_name = object_path_segments(
+                object_type, object_name, OBJECT_TYPE_TO_DUMP_DIR
+            )
             # HTTP-endpoint отдаёт имя и заголовок формы (синоним из конфигурации).
             form: dict[str, Any] = {}
             http_error: Exception | None = None
             dump_note = ""
             try:
-                form = await client.get(f"/form/{object_type}/{object_name}")
+                form = await client.get(f"/form/{url_type}/{url_name}")
             except OneCError as exc:
                 http_error = exc
 
@@ -96,7 +102,7 @@ def register(
                     f"fetching form structure from 1C: {http_error}"
                 ) from http_error
 
-            return format_form_structure(form) + dump_note
+            return truncate_output(format_form_structure(form) + dump_note)
 
         return await traced_text(
             audit, "get_form_structure", run,

@@ -108,8 +108,14 @@ def format_event_log(r: dict[str, Any]) -> str:
                 lines.append(f"- {label}: {e[key]}")
 
     lines.append("")
+    events_count = len(events)
+    found = r.get("found")
     if r.get("truncated"):
-        lines.append(f"Показано: {len(events)}. Список может быть неполным.")
+        shown = f"Показано: {events_count}"
+        if isinstance(found, int) and found >= events_count:
+            shown += f" из {found}"
+        lines.append(f"{shown}. Список может быть неполным.")
     else:
-        lines.append(f"Всего: {r.get('total', 0)}")
+        total = found if isinstance(found, int) else r.get("total", events_count)
+        lines.append(f"Всего: {total}")
     return "\n".join(lines) + "\n"

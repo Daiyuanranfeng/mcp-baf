@@ -10,7 +10,7 @@ from pydantic import Field
 
 from mcp_baf_audit import AuditWriter
 from mcp_baf.client import OneCClient
-from mcp_baf.tools.common import traced_text
+from mcp_baf.tools.common import traced_text, truncate_output
 
 # Все известные категории метаданных 1С в порядке отображения:
 # (ключ JSON-ответа 1С, отображаемое название).
@@ -73,11 +73,17 @@ def register(mcp: MCPServer, client: OneCClient, audit: AuditWriter) -> None:
             filter_noise(tree)
 
             if filter:
-                filtered = {filter: tree[filter]} if filter in tree else {}
-                return format_metadata_tree(filtered)
+                # Неизвестный filter — ошибка контракта, а не пустой документ:
+                # молчаливый пустой ответ агент принимает за «объектов нет».
+                if filter not in tree:
+                    allowed = ", ".join(sorted(tree)) or "нет данных"
+                    raise ValueError(
+                        f"filter {filter!r} не найден. Допустимые значения: {allowed}"
+                    )
+                return truncate_output(format_metadata_tree({filter: tree[filter]}))
 
             # Без фильтра — только названия категорий и количество объектов.
-            return format_metadata_summary(tree)
+            return truncate_output(format_metadata_summary(tree))
 
         return await traced_text(
             audit, "get_metadata_tree", run, args={"filter": filter}

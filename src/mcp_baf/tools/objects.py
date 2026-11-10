@@ -59,11 +59,20 @@ def parse_link(link: str) -> tuple[str, str]:
     return kind, validate_ref(value)
 
 
+def _required_str(data: dict, key: str, tool: str) -> str:
+    """Обязательное строковое поле ответа 1С: иначе явная ошибка контракта."""
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{tool}: ответ 1С без обязательного поля {key}")
+    return value
+
+
 def format_references(result: dict) -> str:
     lines = ["## Ссылки на объект", "", "В пределах прав и RLS HTTP-пользователя.", ""]
     groups: dict[str, list] = {}
     for hit in result.get("hits", []):
-        groups.setdefault(hit["found_in_meta"], []).append(hit)
+        # Группа — отображаемый ярлык: отсутствие поля не должно ронять инструмент.
+        groups.setdefault(str(hit.get("found_in_meta") or "(без метаданных)"), []).append(hit)
     for meta, hits in groups.items():
         lines += [f"### {escape_pipe(meta)} ({len(hits)})", "", "| Объект / ключ | Поле | Вид |", "|---|---|---|"]
         for h in hits:
@@ -73,7 +82,7 @@ def format_references(result: dict) -> str:
     if result.get("timeout_exceeded") or result.get("truncated") or result.get("skipped_names"):
         lines += ["", "> Поиск неполный: достигнут бюджет/лимит или часть полей недоступна."]
     for s in result.get("skipped_names", []):
-        lines.append(f"- {escape_pipe(s['name'])}: {escape_pipe(s['reason'])}")
+        lines.append(f"- {escape_pipe(str(s.get('name', '')))}: {escape_pipe(str(s.get('reason', '')))}")
     return "\n".join(lines)
 
 
@@ -108,7 +117,7 @@ def register(mcp, client, audit):
             if not output_link.startswith("e1cib/data/") or any(c in output_link for c in "\r\n<>"):
                 raise ValueError("Платформа вернула неподдерживаемую навигационную ссылку")
             output_link = output_link.replace("(", "%28").replace(")", "%29")
-            return f"## Объект\n\n[{label}]({output_link})\n\nТип: `{r['kind']}`\nGUID: `{r['ref']}`"
+            return f"## Объект\n\n[{label}]({output_link})\n\nТип: `{_required_str(r, 'kind', 'get_object_link')}`\nGUID: `{_required_str(r, 'ref', 'get_object_link')}`"
         return await traced_text(audit, "get_object_link", run, args={"mode": mode, "ref": ref, "kind": kind})
 
     @mcp.tool(description="Права объекта метаданных для текущего HTTP-пользователя; user_name и roles требуют административных прав. rights — имена прав платформы, пустой список использует типовые права объекта. Проверка RLS не выполняется. Недоступная проверка не означает отсутствие права.", annotations=ToolAnnotations(read_only_hint=True))
@@ -122,7 +131,7 @@ def register(mcp, client, audit):
             for row in r.get("rights", []):
                 allowed = row.get("allowed")
                 value = "да" if allowed is True else "нет" if allowed is False else "проверка недоступна"
-                lines.append(f"| {escape_pipe(row['right'])} | {escape_pipe(row['subject'])} | {value} |")
+                lines.append(f"| {escape_pipe(str(row.get('right', '')))} | {escape_pipe(str(row.get('subject', '')))} | {value} |")
             lines += [f"\n> {escape_pipe(n)}" for n in r.get("notes", [])]
             return "\n".join(lines)
         return await traced_text(audit, "get_metadata_rights", run, args={"metadata_object": metadata_object, "user_name": user_name, "rights": rights, "roles": roles})
