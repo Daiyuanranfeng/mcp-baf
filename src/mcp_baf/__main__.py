@@ -209,11 +209,24 @@ def _resolve_tls(config: Config) -> tuple[str, str]:
     return cert, key
 
 
+def _host_pattern(host: str) -> str:
+    """Шаблон Host для DNS-rebinding: без порту додає :*, явний порт зберігає.
+
+    SDK порівнює Host точно або за шаблоном ``host:*``, тому запис без порту
+    ніколи не збігається з реальним ``host:port``. IPv6 беремо в дужки.
+    """
+    if host.startswith("["):
+        return host if "]:" in host else f"{host}:*"
+    if host.count(":") >= 2:
+        return f"[{host}]:*"
+    return host if ":" in host else f"{host}:*"
+
+
 def _http_security(allowed_hosts: str, scheme: str):
-    """Защита от DNS-rebinding: пусто — выключена (server-to-server по имени сервиса)."""
+    """Захист від DNS-rebinding: пусто — виключений (server-to-server за іменем сервісу)."""
     from mcp.server.transport_security import TransportSecuritySettings
 
-    hosts = [h.strip() for h in allowed_hosts.split(",") if h.strip()]
+    hosts = [_host_pattern(h.strip()) for h in allowed_hosts.split(",") if h.strip()]
     if not hosts:
         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
     return TransportSecuritySettings(

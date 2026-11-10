@@ -7,6 +7,43 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_host_pattern_adds_a_wildcard_port_only_when_missing():
+    from mcp_baf.__main__ import _host_pattern
+
+    assert _host_pattern("mcp-baf") == "mcp-baf:*"
+    assert _host_pattern("mcp-baf:18001") == "mcp-baf:18001"
+    assert _host_pattern("[::1]") == "[::1]:*"
+    assert _host_pattern("[::1]:8001") == "[::1]:8001"
+    assert _host_pattern("::1") == "[::1]:*"
+
+
+def test_http_security_accepts_a_host_with_the_real_port():
+    from mcp_baf.__main__ import _http_security
+
+    security = _http_security("mcp-baf, localhost,example.com:8443,[::1],[::1]:9000", "http")
+    assert security.allowed_hosts == [
+        "mcp-baf:*",
+        "localhost:*",
+        "example.com:8443",
+        "[::1]:*",
+        "[::1]:9000",
+    ]
+    assert security.allowed_origins == [
+        "http://mcp-baf:*",
+        "http://localhost:*",
+        "http://example.com:8443",
+        "http://[::1]:*",
+        "http://[::1]:9000",
+    ]
+
+
+def test_http_security_stays_disabled_for_an_empty_list():
+    from mcp_baf.__main__ import _http_security
+
+    security = _http_security(" , ", "http")
+    assert security.enable_dns_rebinding_protection is False
+
+
 @pytest.mark.parametrize('mode', ['--help', '--version', '--install'])
 def test_cli_works_when_mcp_sdk_import_is_unavailable(tmp_path, mode):
     # Отдельный процесс исключает уже импортированный другими тестами SDK.

@@ -75,7 +75,7 @@
 | `--allow-insecure-http` | `mcp_baf_ALLOW_INSECURE_HTTP` | вимкнено | Явний дозвіл на `--transport http`; без нього сервер не стартує |
 | `--http-host` | `mcp_baf_HTTP_HOST` | `127.0.0.1` | Хост прив'язки для `https`/`http` (у контейнері `0.0.0.0`) |
 | `--http-port` | `mcp_baf_HTTP_PORT` | `8001` | Порт прив'язки для `https`/`http` |
-| `--http-allowed-hosts` | `mcp_baf_HTTP_ALLOWED_HOSTS` | — (захист вимкнено) | Дозволені `Host` через кому; вмикає захист від DNS-rebinding і додає хости в SAN згенерованого сертифіката |
+| `--http-allowed-hosts` | `mcp_baf_HTTP_ALLOWED_HOSTS` | — (захист вимкнено) | Дозволені `Host` через кому; вмикає захист від DNS-rebinding і додає хости в SAN згенерованого сертифіката. Якщо порт не вказано, шаблон отримує `:*` (будь-який порт); IPv6 — у дужках (`[::1]`) |
 | `--http-token` | `mcp_baf_HTTP_TOKEN` (`_FILE`) | — (**обов'язковий** для `https`/`http`) | Bearer-токен: кожен запит несе `Authorization: Bearer <токен>`, інакше `401`. Задавайте через env — CLI видно в `ps` |
 | `--tls-cert` / `--tls-key` | `mcp_baf_TLS_CERT` / `mcp_baf_TLS_KEY` | — (згенерований CA) | Свій PEM-сертифікат і ключ для `https`, обидва або жоден. Якщо жоден — сервер один раз генерує CA і серверний сертифікат у `<cache-dir>/tls/` (`ca.crt` — клієнтам; SAN: `localhost`, `127.0.0.1`, ім'я хоста, `--http-host`, `--http-allowed-hosts`). Змінили хости — видаліть `tls/` |
 
